@@ -800,7 +800,7 @@ jobs:
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
 
-      - name: Provide dummy GKI and Trusty filegroups to satisfy Soong graph
+      - name: Provide dummy GKI, Trusty and vmlinux filegroups to satisfy Soong graph
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -814,7 +814,7 @@ jobs:
           mkdir -p build/soong/dummy_gki
           touch build/soong/dummy_gki/dummy.bin
           
-          # 3. Tạo Android.bp chứa GKI kernel prebuilts
+          # 3. Tạo Android.bp chứa GKI kernel prebuilts & vmlinux
           cat > build/soong/dummy_gki/Android.bp <<'EOF'
           package {
               default_visibility: ["//visibility:public"],
@@ -848,10 +848,23 @@ jobs:
           filegroup { name: "microdroid_gki_kernel_prebuilts-android14-6.1-x86_64", srcs: ["dummy.bin"] }
           filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.1-arm64", srcs: ["dummy.bin"] }
           filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.1-x86_64", srcs: ["dummy.bin"] }
+
+          // vmlinux prebuilts for eBPF tools (system/bpf)
+          filegroup { name: "vmlinux_6_6_arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_6_6_x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_6_1_arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_6_1_x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_5_15_arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_5_15_x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_5_10_arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_5_10_x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_5_4_arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_5_4_x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_4_19_arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "vmlinux_4_19_x86_64", srcs: ["dummy.bin"] }
           EOF
           
           # 4. Vá cấu trúc lệnh mac OS giả cho Trusty OS (darwin-x86 build-tools path)
-          # Xóa symlinks cũ đi trước khi tạo file thực
           rm -rf prebuilts/build-tools/path/darwin-x86 || true
           mkdir -p prebuilts/build-tools/path/darwin-x86
           for cmd in awk basename bc bzcat bzip2 cat chmod cmp comm cp cpio cut date dd dirname du echo egrep env file find getconf getopt grep gzip head hostname id install ln ls md5sum mkdir mktemp mv nl od paste patch printf pwd python3 readlink realpath rm rmdir sed seq setsid sha1sum sha256sum sha512sum sleep sort stat tail tar tee test timeout touch tr true truncate uname uniq unix2dos wc which whoami xargs xxd xz xzcat zipinfo; do
@@ -1420,7 +1433,7 @@ jobs:
           if [ -z "${ANDROID_BUILD_TOP:-}" ] || \
              [ "${TARGET_PRODUCT:-}" != "lineage_starlte" ] || \
              [ "${TARGET_BUILD_VARIANT:-}" != "userdebug" ]; then
-            echo "::error::Invalid LineageOS 22 build configuration (Product=${TARGET_PRODUCT:-}, Release=${TARGET_RELEASE:-})."
+            echo "::error::Invalid LineageOS build configuration (Product=${TARGET_PRODUCT:-}, Release=${TARGET_RELEASE:-})."
             exit 1
           fi
 
