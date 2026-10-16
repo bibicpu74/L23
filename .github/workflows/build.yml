@@ -800,16 +800,71 @@ jobs:
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
 
-      - name: Purge Emulator dependencies and inject Darwin-x86 dummies
+      - name: Provide dummy GKI and Trusty filegroups dynamically
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
           
-          # 1. Cắt bỏ các module ảo hóa Trusty đòi hỏi trình giả lập QEMU
-          BP="trusty/vendor/google/aosp/scripts/Android.bp"
-          if [ -f "$BP" ]; then
-            python3 - "$BP" <<'PYTRUSTY'
+          # 1. Khôi phục các file Android.bp bị xóa lỗi (nếu có)
+          git -C packages/modules/Virtualization restore . || true
+          git -C packages/modules/Virtualization clean -fd || true
+          git -C trusty/vendor/google/aosp restore . || true
+          git -C trusty/vendor/google/aosp clean -fd || true
+          
+          # 2. Tạo file dummy.bin chung
+          mkdir -p build/soong/dummy_gki
+          touch build/soong/dummy_gki/dummy.bin
+          
+          cat > build/soong/dummy_gki/Android.bp <<'EOF'
+          package {
+              default_visibility: ["//visibility:public"],
+          }
+          EOF
+          
+          # 3. Script thông minh tự động quét và chỉ khai báo Dummy cho những module BỊ THIẾU
+          python3 - <<'PYDUMMY'
+          import os, re
+          dummy_modules = [
+              "kernel_aarch64_6.6", "kernel_x86_64_6.6", "kernel_aarch64_6.1", "kernel_x86_64_6.1",
+              "kernel_aarch64_5.15", "kernel_x86_64_5.15", "kernel_aarch64_5.10", "kernel_x86_64_5.10",
+              "kernel_aarch64_5.4", "kernel_x86_64_5.4", "kernel_aarch64_4.19", "kernel_x86_64_4.19",
+              "kernel_aarch64_mainline", "kernel_x86_64_mainline",
+              "microdroid_gki_modules-android15-6.6-arm64", "microdroid_gki_modules-android15-6.6-x86_64",
+              "microdroid_gki_modules-android14-6.1-arm64", "microdroid_gki_modules-android14-6.1-x86_64",
+              "microdroid_gki_modules-android15-6.1-arm64", "microdroid_gki_modules-android15-6.1-x86_64",
+              "microdroid_gki_kernel_prebuilts-android15-6.6-arm64", "microdroid_gki_kernel_prebuilts-android15-6.6-x86_64",
+              "microdroid_gki_kernel_prebuilts-android14-6.1-arm64", "microdroid_gki_kernel_prebuilts-android14-6.1-x86_64",
+              "microdroid_gki_kernel_prebuilts-android15-6.1-arm64", "microdroid_gki_kernel_prebuilts-android15-6.1-x86_64",
+              "vmlinux_6_6_arm64", "vmlinux_6_6_x86_64", "vmlinux_6_1_arm64", "vmlinux_6_1_x86_64",
+              "vmlinux_5_15_arm64", "vmlinux_5_15_x86_64", "vmlinux_5_10_arm64", "vmlinux_5_10_x86_64",
+              "vmlinux_5_4_arm64", "vmlinux_5_4_x86_64", "vmlinux_4_19_arm64", "vmlinux_4_19_x86_64"
+          ]
+
+          existing_modules = set()
+          if os.path.exists("kernel/prebuilts"):
+              for root, dirs, files in os.walk("kernel/prebuilts"):
+                  if "Android.bp" in files:
+                      try:
+                          with open(os.path.join(root, "Android.bp"), "r", errors="ignore") as f:
+                              content = f.read()
+                              matches = re.findall(r'name:\s*"([^"]+)"', content)
+                              existing_modules.update(matches)
+                      except Exception:
+                          pass
+
+          with open("build/soong/dummy_gki/Android.bp", "a") as f:
+              for mod in dummy_modules:
+                  if mod in existing_modules:
+                      print(f"Skipping dummy generation for {mod} (already exists in kernel/prebuilts)")
+                  else:
+                      f.write(f'filegroup {{ name: "{mod}", srcs: ["dummy.bin"] }}\n')
+          PYDUMMY
+          
+          # 4. Cắt bỏ các module ảo hóa Trusty đòi hỏi trình giả lập QEMU
+          BP_TRUSTY="trusty/vendor/google/aosp/scripts/Android.bp"
+          if [ -f "$BP_TRUSTY" ]; then
+            python3 - "$BP_TRUSTY" <<'PYTRUSTY'
           import pathlib, sys
           bp_path = pathlib.Path(sys.argv[1])
           lines = bp_path.read_text().splitlines(keepends=True)
@@ -837,7 +892,7 @@ jobs:
           PYTRUSTY
           fi
 
-          # 2. Vá cấu trúc lệnh mac OS giả cho Trusty OS (darwin-x86 build-tools path)
+          # 5. Vá cấu trúc lệnh mac OS giả cho Trusty OS (darwin-x86 build-tools path)
           rm -rf prebuilts/build-tools/path/darwin-x86 || true
           mkdir -p prebuilts/build-tools/path/darwin-x86
           for cmd in awk basename bc bzcat bzip2 cat chmod cmp comm cp cpio cut date dd dirname du echo egrep env file find getconf getopt grep gzip head hostname id install ln ls md5sum mkdir mktemp mv nl od paste patch printf pwd python3 readlink realpath rm rmdir sed seq setsid sha1sum sha256sum sha512sum sleep sort stat tail tar tee test timeout touch tr true truncate uname uniq unix2dos wc which whoami xargs xxd xz xzcat zipinfo; do
@@ -845,7 +900,7 @@ jobs:
             chmod +x "prebuilts/build-tools/path/darwin-x86/$cmd"
           done
           
-          echo "Successfully handled unused emulator dependencies and darwin-x86 dummies."
+          echo "Successfully injected dynamic dummy filegroups and Darwin-x86 build-tools to satisfy Soong graph."
 
       - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
