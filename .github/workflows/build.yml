@@ -99,7 +99,7 @@ jobs:
       # RBE & Ninja concurrency
       NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
-      LOCAL_NINJA_JOBS: "3"
+      LOCAL_NINJA_JOBS: "4"
 
       # Soong Go GC tuning for graph generation
       SOONG_GOGC: "45"
