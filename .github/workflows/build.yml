@@ -74,7 +74,7 @@ jobs:
       RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
 
       # Loopback Unix Socket -> nginx gRPC TLS proxy with BuildBuddy API key
-      RBE_server_address: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
+      RBE_service: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
       RBE_service_no_security: "true"
       RBE_service_no_auth: "true"
       RBE_use_application_default_credentials: "false"
@@ -1502,10 +1502,13 @@ jobs:
 
           {
             echo "USE_RBE=${USE_RBE}"
-            echo "RBE_server_address=${RBE_server_address}"
+            echo "RBE_service=${RBE_service}"
             echo "RBE_depsscanner_address=${RBE_depsscanner_address}"
             echo "RBE_service_no_security=${RBE_service_no_security}"
             echo "RBE_service_no_auth=${RBE_service_no_auth}"
+            echo "RBE_use_application_default_credentials=${RBE_use_application_default_credentials}"
+            echo "RBE_use_gce_credentials=${RBE_use_gce_credentials}"
+            echo "RBE_use_rpc_credentials=${RBE_use_rpc_credentials}"
             echo "RBE_DIR=${RBE_DIR}"
             echo "RBE_WRAPPER=${RBE_WRAPPER}"
             echo "RBE_exec_root=${RBE_exec_root}"
