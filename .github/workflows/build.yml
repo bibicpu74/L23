@@ -75,8 +75,11 @@ jobs:
 
       # Loopback Unix Socket -> nginx gRPC TLS proxy with BuildBuddy API key
       RBE_server_address: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
+      RBE_service_no_security: "true"
+      RBE_service_no_auth: "true"
       RBE_use_application_default_credentials: "false"
       RBE_use_gce_credentials: "false"
+      RBE_use_rpc_credentials: "false"
       RBE_depsscanner_address: "execrel://"
 
       # Keep all RBE diagnostics in one place
@@ -817,7 +820,7 @@ jobs:
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
 
-      - name: Provide dummy GKI, Trusty and vmlinux filegroups to satisfy Soong graph
+      - name: Provide dummy GKI, Trusty and vmlinux filegroups dynamically
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -826,18 +829,20 @@ jobs:
           # 1. Khôi phục các file Android.bp bị xóa lỗi nếu đã chạy job trước đó
           git -C packages/modules/Virtualization restore . || true
           git -C packages/modules/Virtualization clean -fd || true
+          git -C trusty/vendor/google/aosp restore . || true
+          git -C trusty/vendor/google/aosp clean -fd || true
           
           # 2. Tạo file dummy.bin chung
           mkdir -p build/soong/dummy_gki
           touch build/soong/dummy_gki/dummy.bin
           
-          # 3. Tạo Android.bp chứa GKI kernel prebuilts & vmlinux
           cat > build/soong/dummy_gki/Android.bp <<'EOF'
           package {
               default_visibility: ["//visibility:public"],
           }
           EOF
 
+          # 3. Quét động và chỉ thêm filegroup nếu chưa tồn tại trong prebuilts
           python3 - <<'PYDUMMY'
           import os, re
           dummy_modules = [
@@ -1499,6 +1504,8 @@ jobs:
             echo "USE_RBE=${USE_RBE}"
             echo "RBE_server_address=${RBE_server_address}"
             echo "RBE_depsscanner_address=${RBE_depsscanner_address}"
+            echo "RBE_service_no_security=${RBE_service_no_security}"
+            echo "RBE_service_no_auth=${RBE_service_no_auth}"
             echo "RBE_DIR=${RBE_DIR}"
             echo "RBE_WRAPPER=${RBE_WRAPPER}"
             echo "RBE_exec_root=${RBE_exec_root}"
