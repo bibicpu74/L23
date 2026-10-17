@@ -73,12 +73,10 @@ jobs:
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
 
-      # Loopback plaintext h2c -> nginx gRPC TLS proxy with BuildBuddy API key
-      RBE_service: "127.0.0.1:19099"
-      RBE_service_no_security: "true"
-      RBE_service_no_auth: "true"
+      # Loopback Unix Socket -> nginx gRPC TLS proxy with BuildBuddy API key
+      RBE_server_address: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
       RBE_use_application_default_credentials: "false"
-      RBE_use_rpc_credentials: "false"
+      RBE_use_gce_credentials: "false"
       RBE_depsscanner_address: "execrel://"
 
       # Keep all RBE diagnostics in one place
@@ -99,7 +97,7 @@ jobs:
       # RBE & Ninja concurrency
       NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
-      LOCAL_NINJA_JOBS: "4"
+      LOCAL_NINJA_JOBS: "3"
 
       # Soong Go GC tuning for graph generation
       SOONG_GOGC: "45"
@@ -459,25 +457,6 @@ jobs:
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
-      - name: Fix Exynos 9810 SoundBooster effect flag for Android 15/16
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
-          FILE="device/samsung/exynos9810-common/audio/soundbooster/SoundBoosterEffect.cpp"
-      
-          if [ -f "$FILE" ]; then
-           if grep -q "EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND" "$FILE"; then
-          # Thay thế cờ bị xóa thành số 0 (an toàn trong phép bitwise OR)
-            sed -i 's/EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND/0/g' "$FILE"
-            echo "Successfully patched EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND in $FILE"
-            git -C device/samsung/exynos9810-common diff > /tmp/rbe-test/audio-soundbooster-fix.patch || true
-           else
-            echo "Flag not found or already patched."
-           fi
-          else
-           echo "SoundBoosterEffect.cpp not found; skipping."
-          fi
       - name: Capture locked source manifest before checkout modifications
         working-directory: /home/runner/work/los
         shell: bash
@@ -559,6 +538,25 @@ jobs:
           git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc \
             > /tmp/rbe-test/sonivox-fix.patch || true
           echo 'SONIVOX_CPP_PREFLIGHT_PASSED'
+
+      - name: Fix Exynos 9810 SoundBooster effect flag for Android 15/16
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="device/samsung/exynos9810-common/audio/soundbooster/SoundBoosterEffect.cpp"
+          
+          if [ -f "$FILE" ]; then
+            if grep -q "EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND" "$FILE"; then
+              sed -i 's/EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND/0/g' "$FILE"
+              echo "Successfully patched EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND in $FILE"
+              git -C device/samsung/exynos9810-common diff > /tmp/rbe-test/audio-soundbooster-fix.patch || true
+            else
+              echo "Flag not found or already patched."
+            fi
+          else
+            echo "SoundBoosterEffect.cpp not found; skipping."
+          fi
 
       - name: Resolve and validate Chromium WebView arm64 Git LFS
         working-directory: /home/runner/work/los
@@ -819,29 +817,27 @@ jobs:
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
 
-      - name: Provide dummy GKI and Trusty filegroups dynamically
+      - name: Provide dummy GKI, Trusty and vmlinux filegroups to satisfy Soong graph
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
           
-          # 1. Khôi phục các file Android.bp bị xóa lỗi (nếu có)
+          # 1. Khôi phục các file Android.bp bị xóa lỗi nếu đã chạy job trước đó
           git -C packages/modules/Virtualization restore . || true
           git -C packages/modules/Virtualization clean -fd || true
-          git -C trusty/vendor/google/aosp restore . || true
-          git -C trusty/vendor/google/aosp clean -fd || true
           
           # 2. Tạo file dummy.bin chung
           mkdir -p build/soong/dummy_gki
           touch build/soong/dummy_gki/dummy.bin
           
+          # 3. Tạo Android.bp chứa GKI kernel prebuilts & vmlinux
           cat > build/soong/dummy_gki/Android.bp <<'EOF'
           package {
               default_visibility: ["//visibility:public"],
           }
           EOF
-          
-          # 3. Script thông minh tự động quét và chỉ khai báo Dummy cho những module BỊ THIẾU
+
           python3 - <<'PYDUMMY'
           import os, re
           dummy_modules = [
@@ -874,12 +870,10 @@ jobs:
 
           with open("build/soong/dummy_gki/Android.bp", "a") as f:
               for mod in dummy_modules:
-                  if mod in existing_modules:
-                      print(f"Skipping dummy generation for {mod} (already exists in kernel/prebuilts)")
-                  else:
+                  if mod not in existing_modules:
                       f.write(f'filegroup {{ name: "{mod}", srcs: ["dummy.bin"] }}\n')
           PYDUMMY
-          
+
           # 4. Cắt bỏ các module ảo hóa Trusty đòi hỏi trình giả lập QEMU
           BP_TRUSTY="trusty/vendor/google/aosp/scripts/Android.bp"
           if [ -f "$BP_TRUSTY" ]; then
@@ -907,10 +901,9 @@ jobs:
                   out.append(lines[i])
                   i += 1
           bp_path.write_text(''.join(out))
-          print(f"Purged {removed} Trusty QEMU emulator blocks from {bp_path}")
           PYTRUSTY
           fi
-
+          
           # 5. Vá cấu trúc lệnh mac OS giả cho Trusty OS (darwin-x86 build-tools path)
           rm -rf prebuilts/build-tools/path/darwin-x86 || true
           mkdir -p prebuilts/build-tools/path/darwin-x86
@@ -919,7 +912,7 @@ jobs:
             chmod +x "prebuilts/build-tools/path/darwin-x86/$cmd"
           done
           
-          echo "Successfully injected dynamic dummy filegroups and Darwin-x86 build-tools to satisfy Soong graph."
+          echo "Successfully injected dummy GKI filegroups and Darwin-x86 build-tools to satisfy Soong graph."
 
       - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
@@ -1214,7 +1207,7 @@ jobs:
           timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
           echo "BuildBuddy TCP endpoint is reachable."
 
-      - name: Start authenticated BuildBuddy gRPC bridge
+      - name: Start authenticated BuildBuddy gRPC bridge (with Access Log)
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -1237,10 +1230,13 @@ jobs:
           error_log /tmp/rbe-test/buildbuddy-grpc-errors.log warn;
           events { worker_connections 2048; }
           http {
-            access_log off;
+            # Enable access logging to verify Reclient is actively transmitting data
+            log_format rbe_fmt '$time_iso8601 $status $request_length bytes -> grpc_status=$upstream_trailer_grpc_status';
+            access_log /tmp/rbe-test/nginx-access.log rbe_fmt;
+            
             client_max_body_size 0;
             server {
-              listen 127.0.0.1:19099 http2;
+              listen unix:/tmp/buildbuddy-rbe-bridge/grpc.sock http2;
               server_name localhost;
               location / {
                 grpc_pass grpcs://remote.buildbuddy.io:443;
@@ -1263,8 +1259,8 @@ jobs:
           nginx -t -c "$BRIDGE_DIR/nginx.conf"
           nginx -c "$BRIDGE_DIR/nginx.conf"
           for _ in $(seq 1 20); do
-            if (echo > /dev/tcp/127.0.0.1/19099) >/dev/null 2>&1; then
-              echo "BuildBuddy local gRPC bridge is listening on 127.0.0.1:19099."
+            if [ -S "$BRIDGE_DIR/grpc.sock" ]; then
+              echo "BuildBuddy local gRPC bridge is listening on Unix socket."
               exit 0
             fi
             sleep 1
@@ -1501,9 +1497,8 @@ jobs:
 
           {
             echo "USE_RBE=${USE_RBE}"
-            echo "RBE_service=${RBE_service}"
+            echo "RBE_server_address=${RBE_server_address}"
             echo "RBE_depsscanner_address=${RBE_depsscanner_address}"
-            echo "RBE_service_no_security=${RBE_service_no_security}"
             echo "RBE_DIR=${RBE_DIR}"
             echo "RBE_WRAPPER=${RBE_WRAPPER}"
             echo "RBE_exec_root=${RBE_exec_root}"
@@ -1672,8 +1667,8 @@ jobs:
             local phase="$1" target="$2" log_file="$3" status_file="$4"
             local disk_trip="$5" time_trip="$6" memory_trip="${7:-}"
             local available now free_gib mem_kib seconds_left last_write idle_secs
-            local line wait_rc warned=0 idle_warned=0 tick sample_counter=0
-            local guard_consecutive=0
+            local line wait_rc warned=0 idle_warned=0 warned_rbe=0 tick sample_counter=0
+            local guard_consecutive=0 rbe_reqs=0
             rm -f "$status_file" "$disk_trip" "$time_trip"
             if [ -n "$memory_trip" ]; then rm -f -- "$memory_trip"; fi
             (
@@ -1694,7 +1689,7 @@ jobs:
               exit "$rc"
             ) &
             BUILD_PID=$!
-            echo "=== $phase PID=$BUILD_PID; 10s DISK / RAM / TIME SUPERVISOR ==="
+            echo "=== $phase PID=$BUILD_PID; 10s DISK / RAM / TIME / RBE SUPERVISOR ==="
             while kill -0 "$BUILD_PID" 2>/dev/null; do
               available="$(disk_sample "$phase-sample")"
               now="$(date +%s)"
@@ -1705,7 +1700,14 @@ jobs:
               idle_secs=$((now - last_write))
               if (( idle_secs < 0 )); then idle_secs=0; fi
               swap_free_kib="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
-              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID disk_safe_free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s"
+              
+              rbe_reqs=0
+              if [ -f /tmp/rbe-test/nginx-access.log ]; then
+                rbe_reqs="$(wc -l < /tmp/rbe-test/nginx-access.log 2>/dev/null || echo 0)"
+              fi
+
+              line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') phase=$phase pid=$BUILD_PID disk_safe_free=${free_gib}GiB mem_available=${mem_kib}KiB swap_free=${swap_free_kib}KiB log_idle=${idle_secs}s soft_deadline_remaining=${seconds_left}s rbe_grpc_requests=${rbe_reqs}"
+              
               if (( BTRFS_ACTIVE == 1 )); then
                 root_now="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
                 inner_now="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
@@ -1725,6 +1727,12 @@ jobs:
               sample_counter=$((sample_counter + 1))
               if (( sample_counter % RBE_LOG_SCAN_INTERVAL_SAMPLES == 0 )); then
                 rbe_prune_closed_info || true
+              fi
+
+              # RBE SILENT FALLBACK CHECK
+              if [ "$phase" = "full-rom-build" ] && (( rbe_reqs == 0 && sample_counter > 12 && warned_rbe == 0 )); then
+                echo "::warning::🚨 RBE ALERT: Zero gRPC traffic detected on the bridge after 2 minutes! Reclient is likely ignoring BuildBuddy and falling back to local CPU execution. Expect 6+ hours build time."
+                warned_rbe=1
               fi
 
               if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ] \
@@ -1945,6 +1953,13 @@ jobs:
           sha256sum "$ROM_ZIP" | tee /tmp/rbe-test/rom-sha256.txt
           basename "$ROM_ZIP" > /tmp/rbe-test/rom-filename.txt
           echo "=== FULL ROM BUILD PASSED ==="
+          
+          # Final RBE Summary Log
+          if [ -f /tmp/rbe-test/nginx-access.log ]; then
+             echo "=== RBE EXECUTION SUMMARY ==="
+             TOTAL_REQ="$(wc -l < /tmp/rbe-test/nginx-access.log)"
+             echo "Total gRPC actions sent to BuildBuddy: $TOTAL_REQ"
+          fi
           mark_stage complete
 
       - name: Upload completed LineageOS ROM
@@ -1987,6 +2002,10 @@ jobs:
               echo '```'
             else
               echo 'No verified ROM ZIP created in this run.'
+            fi
+            if [ -f /tmp/rbe-test/nginx-access.log ]; then
+              echo ''
+              echo "✅ **RBE Actions executed**: $(wc -l < /tmp/rbe-test/nginx-access.log)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
