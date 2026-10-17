@@ -463,21 +463,21 @@ jobs:
         working-directory: /home/runner/work/los
         shell: bash
         run: |
-         set -euo pipefail
-         FILE="device/samsung/exynos9810-common/audio/soundbooster/SoundBoosterEffect.cpp"
+          set -euo pipefail
+          FILE="device/samsung/exynos9810-common/audio/soundbooster/SoundBoosterEffect.cpp"
       
-         if [ -f "$FILE" ]; then
-         if grep -q "EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND" "$FILE"; then
+          if [ -f "$FILE" ]; then
+           if grep -q "EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND" "$FILE"; then
           # Thay thế cờ bị xóa thành số 0 (an toàn trong phép bitwise OR)
-          sed -i 's/EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND/0/g' "$FILE"
-          echo "Successfully patched EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND in $FILE"
-          git -C device/samsung/exynos9810-common diff > /tmp/rbe-test/audio-soundbooster-fix.patch || true
-         else
-          echo "Flag not found or already patched."
-         fi
-       else
-         echo "SoundBoosterEffect.cpp not found; skipping."
-       fi
+            sed -i 's/EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND/0/g' "$FILE"
+            echo "Successfully patched EFFECT_FLAG_NOT_ELIGIBLE_SUSPEND in $FILE"
+            git -C device/samsung/exynos9810-common diff > /tmp/rbe-test/audio-soundbooster-fix.patch || true
+           else
+            echo "Flag not found or already patched."
+           fi
+          else
+           echo "SoundBoosterEffect.cpp not found; skipping."
+          fi
       - name: Capture locked source manifest before checkout modifications
         working-directory: /home/runner/work/los
         shell: bash
