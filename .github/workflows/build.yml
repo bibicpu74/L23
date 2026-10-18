@@ -38,6 +38,14 @@ on:
         options:
           - '1'
           - '3'
+      java_rbe_mode:
+        description: "P0: enable R8/D8 over BuildBuddy (Javac stays local); off restores original behavior"
+        type: choice
+        required: true
+        default: dex
+        options:
+          - dex
+          - 'off'
       remote_jobs:
         description: "Parallel RBE actions (24 recommended for speed)"
         type: choice
@@ -72,6 +80,14 @@ jobs:
       USE_RBE: "1"
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
+      # P0: R8/D8 are activated only after the source-code preflight below.
+      JAVA_RBE_MODE: "${{ inputs.java_rbe_mode || 'dex' }}"
+      RBE_R8: "0"
+      RBE_D8: "0"
+      RBE_JAVAC: "0"
+      RBE_R8_EXEC_STRATEGY: "remote_local_fallback"
+      RBE_D8_EXEC_STRATEGY: "remote_local_fallback"
+      RBE_JAVAC_EXEC_STRATEGY: "local"
 
       # Loopback Unix Socket -> nginx gRPC TLS proxy with BuildBuddy API key
       RBE_service: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
@@ -1149,6 +1165,72 @@ jobs:
             exit 1
           fi
 
+      - name: P0 preflight Soong R8/D8 and BuildBuddy default pool
+        working-directory: /home/runner/work/los
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          REPORT=/tmp/rbe-test/java-rbe-source-preflight.txt
+          exec > >(tee "$REPORT") 2>&1
+          echo "P0 java_rbe_mode=${JAVA_RBE_MODE}"
+          case "$JAVA_RBE_MODE" in
+            off)
+              echo 'RBE_R8=0' >> "$GITHUB_ENV"
+              echo 'RBE_D8=0' >> "$GITHUB_ENV"
+              echo 'RBE_JAVAC=0' >> "$GITHUB_ENV"
+              echo 'P0 disabled. Original R8/D8 local build retained.'
+              exit 0 ;;
+            dex) ;;
+            *) echo '::error::Unsupported JAVA_RBE_MODE'; exit 1 ;;
+          esac
+
+          DEX=build/soong/java/dex.go
+          CONFIG=build/soong/java/config/config.go
+          REMOTE=build/soong/remoteexec/remoteexec.go
+          test -s "$DEX" && test -s "$CONFIG" && test -s "$REMOTE"
+          python3 - "$DEX" "$CONFIG" "$REMOTE" <<'P0SOURCE'
+          from pathlib import Path
+          import re, sys
+          dex, config, remote = (Path(p) for p in sys.argv[1:])
+          d, c, r = dex.read_text(), config.read_text(), remote.read_text()
+          for feature in ('RBE_R8', 'RBE_D8'):
+              if not re.search(r'IsEnvTrue\("'+feature+r'"\)', d):
+                  raise SystemExit('P0 source missing active gate: '+feature)
+          for rule in ('r8RE', 'd8RE'):
+              if not re.search(r'\b'+rule+r'\b', d):
+                  raise SystemExit('P0 source missing remote dex rule: '+rule)
+          for strategy in ('RBE_R8_EXEC_STRATEGY', 'RBE_D8_EXEC_STRATEGY'):
+              if strategy not in c:
+                  raise SystemExit('P0 source missing remote strategy: '+strategy)
+          if 'UseREWrapper()' not in d and 'UseRBE()' not in d:
+              raise SystemExit('P0 source has no RBE selection gate')
+          if 'if v == ""' not in r and 'if v == "" {' not in r:
+              raise SystemExit('P0 cannot verify empty Pool property suppression')
+
+          # AOSP java16 pool is not provided by BuildBuddy by default.
+          # StaticVariableWithEnvOverride resolves empty environment to its fallback,
+          # so setting RBE_JAVA_POOL="" would NOT remove Pool=java16.
+          # Change only the fallback to empty: remoteexec omits the Pool key.
+          old = 'pctx.StaticVariableWithEnvOverride("REJavaPool", "RBE_JAVA_POOL", "java16")'
+          new = 'pctx.StaticVariableWithEnvOverride("REJavaPool", "RBE_JAVA_POOL", "")'
+          if c.count(old) != 1:
+              raise SystemExit('P0 unexpected Java pool source; no speculative patch applied')
+          if 'RBE_JAVA_POOL' in __import__('os').environ and __import__('os').environ['RBE_JAVA_POOL']:
+              raise SystemExit('P0 non-empty RBE_JAVA_POOL would override default BuildBuddy pool')
+          config.write_text(c.replace(old, new, 1))
+          print('Verified remote R8/D8 selection and exec strategy. Javac intentionally local.')
+          print('Patched only REJavaPool fallback: java16 -> empty (BuildBuddy default pool).')
+          print('Remote Java actions retain the source-defined Android container-image.')
+          P0SOURCE
+
+          git -C build/soong diff -- java/config/config.go | head -80
+          echo 'RBE_R8=1' >> "$GITHUB_ENV"
+          echo 'RBE_D8=1' >> "$GITHUB_ENV"
+          echo 'RBE_JAVAC=0' >> "$GITHUB_ENV"
+          echo 'P0 source preflight PASS. R8/D8 enabled for graph generation.'
+
       - name: Route only two Sonivox ARM assembly actions around RBE scanner
         working-directory: /home/runner/work/los
         shell: bash
@@ -1514,6 +1596,14 @@ jobs:
             echo "RBE_exec_root=${RBE_exec_root}"
             echo "RBE_relative_working_dir=${RBE_REL_WORKDIR}"
             echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
+            echo "JAVA_RBE_MODE=${JAVA_RBE_MODE}"
+            echo "RBE_R8=${RBE_R8}"
+            echo "RBE_D8=${RBE_D8}"
+            echo "RBE_JAVAC=${RBE_JAVAC}"
+            echo "RBE_R8_EXEC_STRATEGY=${RBE_R8_EXEC_STRATEGY}"
+            echo "RBE_D8_EXEC_STRATEGY=${RBE_D8_EXEC_STRATEGY}"
+            echo "RBE_JAVAC_EXEC_STRATEGY=${RBE_JAVAC_EXEC_STRATEGY}"
+            echo "RBE_JAVA_POOL=${RBE_JAVA_POOL:-<BuildBuddy default (no Pool property)>}"
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
             echo "NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}"
             echo "NINJA_LOCAL_PARALLEL=${LOCAL_NINJA_JOBS}"
@@ -1790,6 +1880,70 @@ jobs:
           }
 
           enforce_initial_disk_guard pre-graph
+          if [ "$JAVA_RBE_MODE" = dex ]; then
+            mark_stage java-rbe-remote-smoke
+            echo '=== P0: remote-only BuildBuddy smoke test (no local fallback) ==='
+            SMOKE=out/p0-java-rbe-remote-smoke.txt
+            rm -f "$SMOKE"
+            # Match the Android container-image used by Soong remote rules.
+            IMAGE="$(python3 - <<'P0IMAGE'
+          import pathlib, re
+          s = pathlib.Path('build/soong/remoteexec/remoteexec.go').read_text()
+          m = re.search(r'DefaultImage\s*=\s*"([^"]+)"', s)
+          if not m: raise SystemExit('P0 cannot find Soong remote image')
+          print(m.group(1))
+          P0IMAGE
+            )"
+            SMOKE_LOG=/tmp/rbe-test/java-rbe-remote-smoke.log
+            SMOKE_BOOT_LOG=/tmp/rbe-test/java-rbe-bootstrap.log
+            # A plain `m nothing` has not yet started reproxy. Start a dedicated
+            # short-lived proxy, then shut it down BEFORE Soong owns the proxy.
+            set +e
+            timeout 40s "$RBE_DIR/bootstrap" \
+              -re_proxy="$PWD/$RBE_DIR/reproxy" \
+              -output_dir=/tmp/rbe-test -reproxy_wait_seconds=30 \
+              > "$SMOKE_BOOT_LOG" 2>&1
+            BOOT_RC=$?
+            set -e
+            if [ "$BOOT_RC" -ne 0 ]; then
+              cat "$SMOKE_BOOT_LOG"
+              echo '::error::P0 could not bootstrap reproxy for remote smoke test.'
+              exit 74
+            fi
+            SMOKE_START_REQ=$(wc -l < /tmp/rbe-test/nginx-access.log 2>/dev/null || echo 0)
+            set +e
+            timeout 150s "$RBE_WRAPPER" \
+              --labels=type=tool,name=p0-r8-d8-smoke \
+              --exec_root="$RBE_exec_root" \
+              --platform="container-image=$IMAGE" \
+              --exec_strategy=remote \
+              --remote_accept_cache=false \
+              --exec_timeout=90s \
+              --output_files="los/$SMOKE" \
+              -- /bin/sh -c 'mkdir -p out && printf "p0-buildbuddy-remote-ok\n" > out/p0-java-rbe-remote-smoke.txt' \
+              > "$SMOKE_LOG" 2>&1
+            SMOKE_RC=$?
+            timeout 40s "$RBE_DIR/bootstrap" \
+              -shutdown -output_dir=/tmp/rbe-test \
+              > /tmp/rbe-test/java-rbe-bootstrap-shutdown.log 2>&1
+            SHUTDOWN_RC=$?
+            set -e
+            cat "$SMOKE_LOG"
+            if [ "$SHUTDOWN_RC" -ne 0 ]; then
+              echo '::warning::P0 temporary reproxy shutdown returned nonzero; check bootstrap shutdown log.'
+            fi
+            SMOKE_END_REQ=$(wc -l < /tmp/rbe-test/nginx-access.log 2>/dev/null || echo 0)
+            printf 'rc=%s\nrequests_before=%s\nrequests_after=%s\nimage=%s\n' \
+              "$SMOKE_RC" "$SMOKE_START_REQ" "$SMOKE_END_REQ" "$IMAGE" \
+              > /tmp/rbe-test/java-rbe-remote-smoke-status.txt
+            if (( SMOKE_RC != 0 || SMOKE_END_REQ <= SMOKE_START_REQ )) || \
+               [ ! -s "$SMOKE" ] || \
+               ! grep -Fxq 'p0-buildbuddy-remote-ok' "$SMOKE"; then
+              echo '::error::P0 remote-only smoke FAILED; R8/D8 would probably fallback to local. Stop before expensive Soong graph.'
+              exit 74
+            fi
+            echo 'P0 remote-only smoke PASS: BuildBuddy executed a real action without local fallback.'
+          fi
           mark_stage build-graph
           exec 1>&3 2>&4
           exec 3>&- 4>&-
@@ -1816,6 +1970,7 @@ jobs:
           test -s "$LOCK"
           sha256sum -c /tmp/rbe-test/source-manifest-locked.sha256
           git -C build/soong diff -- cmd/soong_build/main.go > /tmp/rbe-test/soong-gc-direct.patch || true
+          git -C build/soong diff -- java/config/config.go > /tmp/rbe-test/java-rbe-default-pool.patch || true
           git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc > /tmp/rbe-test/sonivox-fix.patch || true
           if [ "${SAFE_GIT_OBJECT_TRIM}" = "1" ]; then
             REAL=.repo/repo/repo
@@ -1914,6 +2069,55 @@ jobs:
           if [[ "${RBE_CXX_EXEC_STRATEGY:-}" != "remote" && "${RBE_CXX_EXEC_STRATEGY:-}" != "remote_local_fallback" ]]; then
             echo '::error::Remote or fallback C/C++ strategy is required for this trial.'
             exit 73
+          fi
+
+          # Validate that the generated Ninja graph actually selects remote dex
+          # rules. This is distinct from the smoke above: smoke verifies remote
+          # worker availability; the graph check verifies Soong R8/D8 wiring.
+          if [ "$JAVA_RBE_MODE" = dex ]; then
+            mark_stage java-rbe-graph-check
+            python3 - "$SOONG_NINJA" <<'P0GRAPH'
+          from pathlib import Path
+          import re, sys
+          graph = Path(sys.argv[1])
+          report = Path('/tmp/rbe-test/java-rbe-graph-check.txt')
+          rules, counts = {}, {}
+          current = None
+          with graph.open(errors='replace') as stream:
+              for raw in stream:
+                  if raw.startswith('rule '):
+                      current = raw[5:].strip()
+                      if re.search(r'(?:r8|d8).*RE$', current, re.I):
+                          rules[current] = {'wrapper':False, 'remote_strategy':False, 'pool_java16':False}
+                  elif raw.startswith('build '):
+                      match = re.search(r':\s+(\S+)', raw)
+                      if match:
+                          name = match.group(1)
+                          if re.search(r'(?:r8|d8).*RE$', name, re.I):
+                              counts[name] = counts.get(name, 0)+1
+                      current = None
+                  elif current in rules:
+                      rule = rules[current]
+                      if 'rewrapper' in raw or 'RBE_WRAPPER' in raw:
+                          rule['wrapper'] = True
+                      if '--exec_strategy=remote_local_fallback' in raw or '--exec_strategy=remote' in raw:
+                          rule['remote_strategy'] = True
+                      if 'Pool=java16' in raw:
+                          rule['pool_java16'] = True
+          found_r8 = sum(n for k,n in counts.items() if 'r8' in k.lower())
+          found_d8 = sum(n for k,n in counts.items() if 'd8' in k.lower())
+          summary = [f'soong_ninja={graph}', f'remote_r8_actions={found_r8}', f'remote_d8_actions={found_d8}']
+          for name in sorted(rules):
+              summary.append(f'rule={name} actions={counts.get(name,0)} props={rules[name]}')
+          report.write_text('\n'.join(summary)+'\n')
+          print('\n'.join(summary[:25]))
+          if found_r8 == 0 or found_d8 == 0:
+              raise SystemExit('P0 graph has no remote R8 or D8 build actions; abort to avoid wasted 6h')
+          used = [v for k,v in rules.items() if counts.get(k,0)]
+          if not used or any(not v['wrapper'] or not v['remote_strategy'] or v['pool_java16'] for v in used):
+              raise SystemExit('P0 remote dex rule has missing wrapper/strategy or unwanted java16 pool')
+          print('P0 Ninja graph remote R8/D8 verification PASS')
+          P0GRAPH
           fi
 
           mark_stage pre-build
