@@ -85,9 +85,9 @@ jobs:
       RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
       # P0: R8/D8 are activated only after the source-code preflight below.
       JAVA_RBE_MODE: "${{ inputs.java_rbe_mode || 'dex' }}"
-      RBE_R8: "0"
-      RBE_D8: "0"
-      RBE_JAVAC: "0"
+      RBE_R8: "false"
+      RBE_D8: "false"
+      RBE_JAVAC: "false"
       RBE_R8_EXEC_STRATEGY: "remote_local_fallback"
       RBE_D8_EXEC_STRATEGY: "remote_local_fallback"
       RBE_JAVAC_EXEC_STRATEGY: "local"
@@ -1180,9 +1180,9 @@ jobs:
           echo "P0 java_rbe_mode=${JAVA_RBE_MODE}"
           case "$JAVA_RBE_MODE" in
             off)
-              echo 'RBE_R8=0' >> "$GITHUB_ENV"
-              echo 'RBE_D8=0' >> "$GITHUB_ENV"
-              echo 'RBE_JAVAC=0' >> "$GITHUB_ENV"
+              echo 'RBE_R8=false' >> "$GITHUB_ENV"
+              echo 'RBE_D8=false' >> "$GITHUB_ENV"
+              echo 'RBE_JAVAC=false' >> "$GITHUB_ENV"
               echo 'P0 disabled. Original R8/D8 local build retained.'
               exit 0 ;;
             dex) ;;
@@ -1231,7 +1231,7 @@ jobs:
           git -C build/soong diff -- java/config/config.go | head -80
           echo 'RBE_R8=1' >> "$GITHUB_ENV"
           echo 'RBE_D8=1' >> "$GITHUB_ENV"
-          echo 'RBE_JAVAC=0' >> "$GITHUB_ENV"
+          echo 'RBE_JAVAC=false' >> "$GITHUB_ENV"
           echo 'P0 source preflight PASS. R8/D8 enabled for graph generation.'
 
       - name: Route only two Sonivox ARM assembly actions around RBE scanner
