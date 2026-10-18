@@ -1928,16 +1928,29 @@ jobs:
               exit 74
             fi
             SMOKE_START_REQ=$(wc -l < /tmp/rbe-test/nginx-access.log 2>/dev/null || echo 0)
+            # The action's cwd is $RBE_REL_WORKDIR (normally "los") relative
+            # to RBE_exec_root. Remote Execution requires that working_directory
+            # to exist in the uploaded input tree. Include one small, real Soong
+            # source file so the Merkle tree contains los/ before execution.
+            SMOKE_INPUT="${RBE_REL_WORKDIR}/build/soong/remoteexec/remoteexec.go"
+            if [ ! -s "$RBE_exec_root/$SMOKE_INPUT" ]; then
+              echo "::error::P0 smoke input missing: $RBE_exec_root/$SMOKE_INPUT"
+              exit 74
+            fi
+            printf 'working_directory=%s\ninput=%s\n' \
+              "$RBE_REL_WORKDIR" "$SMOKE_INPUT" \
+              >> /tmp/rbe-test/java-rbe-proxy-endpoints.txt
             set +e
             timeout 150s "$RBE_WRAPPER" \
               --server_address="$SMOKE_PROXY" \
               --labels=type=tool,name=p0-r8-d8-smoke \
               --exec_root="$RBE_exec_root" \
+              --inputs="$SMOKE_INPUT" \
               --platform="container-image=$IMAGE" \
               --exec_strategy=remote \
               --remote_accept_cache=false \
               --exec_timeout=90s \
-              --output_files="los/$SMOKE" \
+              --output_files="${RBE_REL_WORKDIR}/$SMOKE" \
               -- /bin/sh -c 'mkdir -p out && printf "p0-buildbuddy-remote-ok\n" > out/p0-java-rbe-remote-smoke.txt' \
               > "$SMOKE_LOG" 2>&1
             SMOKE_RC=$?
@@ -1960,7 +1973,7 @@ jobs:
             if (( SMOKE_RC != 0 || SMOKE_END_REQ <= SMOKE_START_REQ )) || \
                [ ! -s "$SMOKE" ] || \
                ! grep -Fxq 'p0-buildbuddy-remote-ok' "$SMOKE"; then
-              echo '::error::P0 remote-only smoke FAILED; R8/D8 would probably fallback to local. Stop before expensive Soong graph.'
+              echo '::error::P0 remote-only smoke FAILED; inspect java-rbe-remote-smoke.log before the expensive Soong graph.'
               exit 74
             fi
             echo 'P0 remote-only smoke PASS: BuildBuddy executed a real action without local fallback.'
