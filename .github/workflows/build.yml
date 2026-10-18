@@ -77,7 +77,10 @@ jobs:
       BTRFS_ZSTD_LEVEL: "${{ inputs.btrfs_zstd_level || '1' }}"
 
       # Android / Soong RBE
-      USE_RBE: "1"
+      # Keep both explicit: Soong dex remote rules require UseREWrapper() in
+      # addition to the per-tool RBE_R8 / RBE_D8 feature gates.
+      USE_RBE: "true"
+      USE_REWRAPPER: "true"
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
       # P0: R8/D8 are activated only after the source-code preflight below.
@@ -1584,6 +1587,7 @@ jobs:
 
           {
             echo "USE_RBE=${USE_RBE}"
+            echo "USE_REWRAPPER=${USE_REWRAPPER}"
             echo "RBE_service=${RBE_service}"
             echo "RBE_depsscanner_address=${RBE_depsscanner_address}"
             echo "RBE_service_no_security=${RBE_service_no_security}"
@@ -2105,52 +2109,125 @@ jobs:
             exit 73
           fi
 
-          # Validate that the generated Ninja graph actually selects remote dex
-          # rules. This is distinct from the smoke above: smoke verifies remote
-          # worker availability; the graph check verifies Soong R8/D8 wiring.
+          # Validate that Soong consumed the RBE feature gates, then ask Ninja to
+          # resolve the real commands. Parsing only rule names in one Soong ninja
+          # file is too narrow because current branches also use combined/incremental
+          # dex rules and subninja includes.
           if [ "$JAVA_RBE_MODE" = dex ]; then
             mark_stage java-rbe-graph-check
-            python3 - "$SOONG_NINJA" <<'P0GRAPH'
+
+            SOONG_VARIABLES_FILE=""
+            for candidate in \
+              "$ANDROID_BUILD_TOP/out/soong/soong.variables" \
+              "$ANDROID_BUILD_TOP/out/soong/soong.${TARGET_PRODUCT}.variables"; do
+              if [ -s "$candidate" ]; then
+                SOONG_VARIABLES_FILE="$candidate"
+                break
+              fi
+            done
+            if [ -z "$SOONG_VARIABLES_FILE" ]; then
+              SOONG_VARIABLES_FILE="$(
+                find "$ANDROID_BUILD_TOP/out/soong" -maxdepth 1 -type f \
+                  -name 'soong*.variables' -print 2>/dev/null | head -1
+              )"
+            fi
+            if [ -z "$SOONG_VARIABLES_FILE" ] || [ ! -s "$SOONG_VARIABLES_FILE" ]; then
+              echo '::error::P0 could not locate generated soong.variables.'
+              exit 73
+            fi
+
+            python3 - "$SOONG_VARIABLES_FILE" <<'P0VARS'
+          import json, sys
           from pathlib import Path
-          import re, sys
-          graph = Path(sys.argv[1])
+          src = Path(sys.argv[1])
+          report = Path('/tmp/rbe-test/java-rbe-soong-variables.txt')
+          data = json.loads(src.read_text())
+          wanted = ('UseRBE', 'UseREWrapper', 'UseRBER8', 'UseRBED8', 'UseRBEJAVAC')
+          lines = [f'soong_variables={src}']
+          for key in wanted:
+              lines.append(f'{key}={data.get(key)!r}')
+          report.write_text('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          required = ('UseRBE', 'UseREWrapper', 'UseRBER8', 'UseRBED8')
+          bad = [key for key in required if data.get(key) is not True]
+          if bad:
+              raise SystemExit('P0 Soong did not enable required remote dex gates: ' + ', '.join(bad))
+          if data.get('UseRBEJAVAC') is True:
+              raise SystemExit('P0 unexpectedly enabled remote Javac; this trial is dex-only')
+          P0VARS
+
+            # ninja -t commands resolves included/subninja rules into the actual
+            # commands. Stream the output instead of writing the full command graph
+            # to disk; keep only bounded R8/D8 samples for diagnostics.
+            python3 - "$BUILD_NINJA" <<'P0GRAPH'
+          from pathlib import Path
+          import os, re, subprocess, sys
+
+          ninja_file = Path(sys.argv[1])
           report = Path('/tmp/rbe-test/java-rbe-graph-check.txt')
-          rules, counts = {}, {}
-          current = None
-          with graph.open(errors='replace') as stream:
-              for raw in stream:
-                  if raw.startswith('rule '):
-                      current = raw[5:].strip()
-                      if re.search(r'(?:r8|d8).*RE$', current, re.I):
-                          rules[current] = {'wrapper':False, 'remote_strategy':False, 'pool_java16':False}
-                  elif raw.startswith('build '):
-                      match = re.search(r':\s+(\S+)', raw)
-                      if match:
-                          name = match.group(1)
-                          if re.search(r'(?:r8|d8).*RE$', name, re.I):
-                              counts[name] = counts.get(name, 0)+1
-                      current = None
-                  elif current in rules:
-                      rule = rules[current]
-                      if 'rewrapper' in raw or 'RBE_WRAPPER' in raw:
-                          rule['wrapper'] = True
-                      if '--exec_strategy=remote_local_fallback' in raw or '--exec_strategy=remote' in raw:
-                          rule['remote_strategy'] = True
-                      if 'Pool=java16' in raw:
-                          rule['pool_java16'] = True
-          found_r8 = sum(n for k,n in counts.items() if 'r8' in k.lower())
-          found_d8 = sum(n for k,n in counts.items() if 'd8' in k.lower())
-          summary = [f'soong_ninja={graph}', f'remote_r8_actions={found_r8}', f'remote_d8_actions={found_d8}']
-          for name in sorted(rules):
-              summary.append(f'rule={name} actions={counts.get(name,0)} props={rules[name]}')
-          report.write_text('\n'.join(summary)+'\n')
-          print('\n'.join(summary[:25]))
-          if found_r8 == 0 or found_d8 == 0:
-              raise SystemExit('P0 graph has no remote R8 or D8 build actions; abort to avoid wasted 6h')
-          used = [v for k,v in rules.items() if counts.get(k,0)]
-          if not used or any(not v['wrapper'] or not v['remote_strategy'] or v['pool_java16'] for v in used):
-              raise SystemExit('P0 remote dex rule has missing wrapper/strategy or unwanted java16 pool')
-          print('P0 Ninja graph remote R8/D8 verification PASS')
+          samples = Path('/tmp/rbe-test/java-rbe-command-samples.txt')
+
+          ninja = os.environ.get('NINJA_BIN') or 'ninja'
+          proc = subprocess.Popen(
+              [ninja, '-f', str(ninja_file), '-t', 'commands'],
+              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+              text=True, errors='replace', bufsize=1)
+
+          remote_r8 = remote_d8 = 0
+          local_r8 = local_d8 = 0
+          java16_remote = 0
+          r8_samples, d8_samples = [], []
+
+          # Match both Java main classes and common command/tool spellings.
+          r8_re = re.compile(r'(?:com\.android\.tools\.r8\.R8\b|(?:^|[ /])r8(?:[ ._/-]|$))', re.I)
+          d8_re = re.compile(r'(?:com\.android\.tools\.r8\.D8\b|(?:^|[ /])d8(?:[ ._/-]|$))', re.I)
+
+          assert proc.stdout is not None
+          for line in proc.stdout:
+              is_r8 = bool(r8_re.search(line))
+              is_d8 = bool(d8_re.search(line))
+              if not (is_r8 or is_d8):
+                  continue
+              remote = ('rewrapper' in line or '--exec_strategy=remote' in line or
+                        '--exec_strategy=remote_local_fallback' in line)
+              if remote and ('Pool=java16' in line or 'pool=java16' in line):
+                  java16_remote += 1
+              if is_r8:
+                  if remote: remote_r8 += 1
+                  else: local_r8 += 1
+                  if len(r8_samples) < 8:
+                      r8_samples.append(line.rstrip())
+              if is_d8:
+                  if remote: remote_d8 += 1
+                  else: local_d8 += 1
+                  if len(d8_samples) < 8:
+                      d8_samples.append(line.rstrip())
+
+          stderr = proc.stderr.read() if proc.stderr is not None else ''
+          rc = proc.wait()
+          summary = [
+              f'build_ninja={ninja_file}',
+              f'ninja_tool_exit={rc}',
+              f'remote_r8_commands={remote_r8}',
+              f'remote_d8_commands={remote_d8}',
+              f'local_r8_commands={local_r8}',
+              f'local_d8_commands={local_d8}',
+              f'remote_java16_pool_commands={java16_remote}',
+          ]
+          report.write_text('\n'.join(summary) + '\n' + (stderr[-4000:] if stderr else ''))
+          sample_lines = ['=== R8 command samples ===', *r8_samples, '',
+                          '=== D8 command samples ===', *d8_samples, '']
+          samples.write_text('\n'.join(sample_lines))
+          print('\n'.join(summary))
+          if rc != 0:
+              raise SystemExit('P0 ninja -t commands failed; see java-rbe-graph-check.txt')
+          if remote_r8 == 0 or remote_d8 == 0:
+              raise SystemExit(
+                  'P0 resolved command graph has no remote R8 or D8 commands; '
+                  'abort before the expensive full ROM build')
+          if java16_remote:
+              raise SystemExit('P0 remote dex commands still request Pool=java16')
+          print('P0 resolved Ninja commands confirm remote R8/D8 via rewrapper')
           P0GRAPH
           fi
 
