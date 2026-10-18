@@ -1912,7 +1912,10 @@ jobs:
             # A plain `m nothing` has not yet started reproxy. Start a dedicated
             # short-lived proxy, then shut it down BEFORE Soong owns the proxy.
             set +e
-            timeout 40s "$RBE_DIR/bootstrap" \
+            # bootstrap's -server_address flag configures its own client.
+            # The spawned reproxy parses RBE_server_address from its environment.
+            # Scope the variable to this process tree; do not leak into Soong.
+            RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
               -server_address="$SMOKE_PROXY" \
               -re_proxy="$PWD/$RBE_DIR/reproxy" \
               -output_dir=/tmp/rbe-test -reproxy_wait_seconds=30 \
@@ -1938,7 +1941,8 @@ jobs:
               -- /bin/sh -c 'mkdir -p out && printf "p0-buildbuddy-remote-ok\n" > out/p0-java-rbe-remote-smoke.txt' \
               > "$SMOKE_LOG" 2>&1
             SMOKE_RC=$?
-            timeout 40s "$RBE_DIR/bootstrap" \
+            # Use the same socket for the bootstrap shutdown RPC.
+            RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
               -server_address="$SMOKE_PROXY" \
               -shutdown -output_dir=/tmp/rbe-test \
               > /tmp/rbe-test/java-rbe-bootstrap-shutdown.log 2>&1
