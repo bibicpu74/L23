@@ -322,7 +322,8 @@ jobs:
           WORKSPACE=/home/runner/work/los
           BACKING=/tmp/los-workspace-btrfs.img
           TOP="${BTRFS_TOP_MOUNT}"
-          mkdir -p /tmp/rbe-test "$WORKSPACE" "$TOP"
+          mkdir -p /tmp/rbe-test "$WORKSPACE"
+          sudo install -d -m 0755 "$TOP"
           if mountpoint -q "$WORKSPACE" || [ -n "$(ls -A "$WORKSPACE")" ]; then
             echo '::error::Android workspace must be empty before Btrfs setup.'
             exit 1
@@ -2714,7 +2715,8 @@ jobs:
             /usr/share/miniconda /usr/local/aws-cli /usr/local/aws-sam-cli \
             /usr/local/share/vcpkg /opt/google /opt/microsoft /usr/share/postgresql \
             /usr/share/mysql /usr/local/julia* || true
-          mkdir -p /home/runner/work/los /mnt/los-btrfs
+          mkdir -p /home/runner/work/los
+          sudo install -d -m 0755 /mnt/los-btrfs
           date +%s > /tmp/job-b-start-epoch.txt
           df -h /
           free -h
@@ -2757,7 +2759,8 @@ jobs:
           WORKSPACE=/home/runner/work/los
           TOP="${BTRFS_TOP_MOUNT}"
           BACKING=/tmp/los-workspace-btrfs.img
-          mkdir -p "$WORKSPACE" "$TOP"
+          mkdir -p "$WORKSPACE"
+          sudo install -d -m 0755 "$TOP"
           test -z "$(ls -A "$WORKSPACE")"
           truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
           sudo mkfs.btrfs -f -m single -d single "$BACKING" >/tmp/btrfs-job-b-mkfs.log 2>&1
