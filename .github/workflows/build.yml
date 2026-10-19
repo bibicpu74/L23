@@ -280,8 +280,22 @@ jobs:
             rclone \
             ca-certificates \
             openssl \
-            unzip \
-            linux-modules-extra-$(uname -r) || true
+            unzip
+
+          # Optional on GitHub-hosted kernels. Keep it outside the required package transaction
+          # so a missing kernel-specific package cannot hide failure to install rclone/btrfs/etc.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "linux-modules-extra-$(uname -r)" || true
+
+          for tool in rclone btrfs zstd nginx; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool missing after dependency installation: $tool"
+              exit 1
+            fi
+          done
+          rclone version | head -2
+          btrfs version
+          zstd --version
 
           mkdir -p "$HOME/bin"
           curl -fsSL \
@@ -2732,9 +2746,21 @@ jobs:
             gnupg gperf imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
             libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
             squashfs-tools btrfs-progs xsltproc zip zlib1g-dev zstd python3 python-is-python3 \
-            openjdk-21-jdk-headless ninja-build nginx rclone ca-certificates openssl unzip \
-            linux-modules-extra-$(uname -r) || true
+            openjdk-21-jdk-headless ninja-build nginx rclone ca-certificates openssl unzip
+
+          # Optional on GitHub-hosted kernels; do not let failure mask required packages.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "linux-modules-extra-$(uname -r)" || true
+
+          for tool in rclone btrfs zstd nginx; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool missing after dependency installation: $tool"
+              exit 1
+            fi
+          done
           rclone version | head -2
+          btrfs version
+          zstd --version
 
       - name: Validate R2 handoff object
         shell: bash
