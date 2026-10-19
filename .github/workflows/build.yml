@@ -104,6 +104,8 @@ jobs:
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: "${{ secrets.R2_SECRET_ACCESS_KEY }}"
       RCLONE_CONFIG_R2_ENDPOINT: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+      RCLONE_CONFIG_R2_REGION: "auto"
+      RCLONE_VERSION: "1.75.2"
 
       # Android / Soong RBE
       # Keep both explicit: Soong dex remote rules require UseREWrapper() in
@@ -235,11 +237,11 @@ jobs:
         with:
           path: repo-config
 
-      - name: Install build dependencies
+      - name: Install build dependencies and pinned rclone
         working-directory: /home/runner/work
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             bc \
@@ -277,15 +279,33 @@ jobs:
             openjdk-21-jdk-headless \
             ninja-build \
             nginx \
-            rclone \
             ca-certificates \
             openssl \
             unzip
 
-          # Optional on GitHub-hosted kernels. Keep it outside the required package transaction
-          # so a missing kernel-specific package cannot hide failure to install rclone/btrfs/etc.
+          # Optional on GitHub-hosted kernels. Keep it outside the required package transaction.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             "linux-modules-extra-$(uname -r)" || true
+
+          # Do not use Ubuntu's old rclone (1.60.1-DEV on ubuntu-24.04 images).
+          # Pin the upstream stable release and verify it against upstream SHA256SUMS.
+          RCLONE_ZIP="/tmp/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          RCLONE_SUMS="/tmp/rclone-v${RCLONE_VERSION}-SHA256SUMS"
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip" \
+            -o "$RCLONE_ZIP"
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS" \
+            -o "$RCLONE_SUMS"
+          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
+          test -n "$EXPECTED_RCLONE_SHA"
+          printf '%s  %s\n' "$EXPECTED_RCLONE_SHA" "$RCLONE_ZIP" | sha256sum -c -
+          rm -rf /tmp/rclone-pinned
+          mkdir -p /tmp/rclone-pinned
+          unzip -q "$RCLONE_ZIP" -d /tmp/rclone-pinned
+          RCLONE_BIN="$(find /tmp/rclone-pinned -type f -name rclone -perm -u+x | head -1)"
+          test -n "$RCLONE_BIN"
+          sudo install -m 0755 "$RCLONE_BIN" /usr/local/bin/rclone
 
           for tool in rclone btrfs zstd nginx; do
             if ! command -v "$tool" >/dev/null 2>&1; then
@@ -293,7 +313,8 @@ jobs:
               exit 1
             fi
           done
-          rclone version | head -2
+          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          rclone version | head -4
           btrfs version
           zstd --version
 
@@ -313,7 +334,7 @@ jobs:
             exit 1
           fi
 
-      - name: Validate R2 checkpoint credentials
+      - name: Validate R2 credentials and multipart streaming path
         shell: bash
         run: |
           set -euo pipefail
@@ -323,9 +344,51 @@ jobs:
               exit 1
             fi
           done
-          rclone version | head -2
+          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          rclone version | head -4
           rclone lsf "r2:${R2_BUCKET}" --max-depth 1 >/tmp/r2-list-probe.txt
-          echo 'R2 credentials and bucket access verified.'
+
+          # Exercise the exact multipart streaming path used by the large Btrfs checkpoint.
+          # 130 MiB > 64 MiB cutoff => CreateMultipartUpload + UploadPart + CompleteMultipartUpload.
+          PROBE_PREFIX="lineage-checkpoints/_ci-probe/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
+          PROBE_KEY="${PROBE_PREFIX}/multipart-130MiB.bin"
+          PROBE_BYTES=$((130 * 1024 * 1024))
+          EXPECTED_SHA="$(dd if=/dev/zero bs=1M count=130 status=none | sha256sum | awk '{print $1}')"
+          cleanup_probe() {
+            rclone deletefile "r2:${R2_BUCKET}/${PROBE_KEY}" >/dev/null 2>&1 || true
+          }
+          trap cleanup_probe EXIT
+
+          echo "=== R2 multipart streaming smoke: ${PROBE_BYTES} bytes ==="
+          dd if=/dev/zero bs=1M count=130 status=none \
+            | timeout 300s rclone rcat "r2:${R2_BUCKET}/${PROBE_KEY}" \
+                --s3-upload-cutoff 64M \
+                --s3-chunk-size 64M \
+                --s3-upload-concurrency 4 \
+                --stats 15s --stats-one-line
+
+          REMOTE_BYTES="$(rclone size "r2:${R2_BUCKET}/${PROBE_KEY}" --json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("bytes",0))')"
+          if [ "$REMOTE_BYTES" != "$PROBE_BYTES" ]; then
+            echo "::error::R2 multipart smoke size mismatch: expected=$PROBE_BYTES actual=$REMOTE_BYTES"
+            exit 1
+          fi
+          REMOTE_SHA="$(rclone cat "r2:${R2_BUCKET}/${PROBE_KEY}" | sha256sum | awk '{print $1}')"
+          if [ "$REMOTE_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::R2 multipart smoke SHA256 mismatch: expected=$EXPECTED_SHA actual=$REMOTE_SHA"
+            exit 1
+          fi
+          rclone deletefile "r2:${R2_BUCKET}/${PROBE_KEY}"
+          trap - EXIT
+          if rclone lsf "r2:${R2_BUCKET}/${PROBE_PREFIX}" --files-only 2>/dev/null \
+              | grep -Fxq "$(basename "$PROBE_KEY")"; then
+            echo '::error::R2 multipart smoke object still exists after delete.'
+            exit 1
+          fi
+          printf 'rclone_version=%s\nprobe_bytes=%s\nprobe_sha256=%s\nstatus=PASS\n' \
+            "$(rclone version | head -1)" "$PROBE_BYTES" "$REMOTE_SHA" \
+            | tee /tmp/r2-multipart-smoke.txt
+          echo 'R2 credentials + multipart PUT/complete/GET/SHA256/delete verified.'
 
       - name: Mount compressed Btrfs ZSTD workspace before repo sync
         if: ${{ inputs.workspace_storage == 'btrfs_zstd' }}
@@ -2519,6 +2582,8 @@ jobs:
 
           HASHER=$'import hashlib,sys\nh=hashlib.sha256()\ni=sys.stdin.buffer\no=sys.stdout.buffer\nf=sys.argv[1]\nwhile True:\n    b=i.read(8*1024*1024)\n    if not b: break\n    h.update(b)\n    o.write(b)\n    o.flush()\nopen(f,"w").write(h.hexdigest()+"\\n")'
 
+          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          echo "checkpoint_rclone_version=$(rclone version | head -1)" >> /tmp/rbe-test/checkpoint-send-mode.txt
           set -o pipefail
           if [ "$SEND_COMPRESSED" = 1 ]; then
             sudo btrfs send --compressed-data "$SNAP" \
@@ -2682,6 +2747,8 @@ jobs:
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: "${{ secrets.R2_SECRET_ACCESS_KEY }}"
       RCLONE_CONFIG_R2_ENDPOINT: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+      RCLONE_CONFIG_R2_REGION: "auto"
+      RCLONE_VERSION: "1.75.2"
 
       USE_RBE: "true"
       USE_REWRAPPER: "true"
@@ -2735,22 +2802,40 @@ jobs:
           df -h /
           free -h
 
-      - name: Install resume runner dependencies
+      - name: Install resume runner dependencies and pinned rclone
         working-directory: /home/runner/work
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             bc bison build-essential curl flex g++-multilib gcc-multilib git git-lfs \
             gnupg gperf imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
             libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
             squashfs-tools btrfs-progs xsltproc zip zlib1g-dev zstd python3 python-is-python3 \
-            openjdk-21-jdk-headless ninja-build nginx rclone ca-certificates openssl unzip
+            openjdk-21-jdk-headless ninja-build nginx ca-certificates openssl unzip
 
           # Optional on GitHub-hosted kernels; do not let failure mask required packages.
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             "linux-modules-extra-$(uname -r)" || true
+
+          RCLONE_ZIP="/tmp/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          RCLONE_SUMS="/tmp/rclone-v${RCLONE_VERSION}-SHA256SUMS"
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip" \
+            -o "$RCLONE_ZIP"
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS" \
+            -o "$RCLONE_SUMS"
+          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
+          test -n "$EXPECTED_RCLONE_SHA"
+          printf '%s  %s\n' "$EXPECTED_RCLONE_SHA" "$RCLONE_ZIP" | sha256sum -c -
+          rm -rf /tmp/rclone-pinned
+          mkdir -p /tmp/rclone-pinned
+          unzip -q "$RCLONE_ZIP" -d /tmp/rclone-pinned
+          RCLONE_BIN="$(find /tmp/rclone-pinned -type f -name rclone -perm -u+x | head -1)"
+          test -n "$RCLONE_BIN"
+          sudo install -m 0755 "$RCLONE_BIN" /usr/local/bin/rclone
 
           for tool in rclone btrfs zstd nginx; do
             if ! command -v "$tool" >/dev/null 2>&1; then
@@ -2758,7 +2843,8 @@ jobs:
               exit 1
             fi
           done
-          rclone version | head -2
+          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          rclone version | head -4
           btrfs version
           zstd --version
 
