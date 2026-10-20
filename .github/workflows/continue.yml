@@ -1,0 +1,595 @@
+name: LineageOS starlte - Resume existing R2 checkpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      lineage_branch:
+        description: "Checkpoint branch (must match metadata)"
+        type: choice
+        required: true
+        default: lineage-23.2
+        options:
+          - lineage-23.2
+      debug_info_level:
+        description: "Clang C/C++ DWARF setting used by the checkpoint"
+        type: choice
+        required: true
+        default: debug_level_1
+        options:
+          - debug_level_1
+      btrfs_zstd_level:
+        description: "Btrfs ZSTD level for restored workspace"
+        type: choice
+        required: true
+        default: '1'
+        options:
+          - '1'
+      remote_jobs:
+        description: "Parallel RBE actions while finishing the ROM"
+        type: choice
+        required: true
+        default: '24'
+        options:
+          - '16'
+          - '20'
+          - '24'
+      checkpoint_prefix:
+        description: "Existing R2 checkpoint prefix"
+        type: string
+        required: true
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39376197341/1"
+      checkpoint_key:
+        description: "Existing R2 Btrfs checkpoint object key"
+        type: string
+        required: true
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39376197341/1/checkpoint-a.btrfs"
+      checkpoint_subvol:
+        description: "Readonly Btrfs subvolume name stored in the send stream"
+        type: string
+        required: true
+        default: "@checkpoint-a-39376197341-1"
+      checkpoint_bytes:
+        description: "Expected checkpoint object size in bytes"
+        type: string
+        required: true
+        default: "86075547791"
+      origin_run_id:
+        description: "GitHub run ID that created this checkpoint"
+        type: string
+        required: true
+        default: "39376197341"
+      origin_run_attempt:
+        description: "GitHub run attempt that created this checkpoint"
+        type: string
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: los-starlte-r2-resume-only
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    name: Resume existing R2 checkpoint and finish ROM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
+      LINEAGE_BRANCH: "${{ inputs.lineage_branch }}"
+      BTRFS_WORKSPACE_IMAGE_GIB: "220"
+      BTRFS_ZSTD_LEVEL: "${{ inputs.btrfs_zstd_level || '1' }}"
+      BTRFS_TOP_MOUNT: "/mnt/los-btrfs"
+      CLANG_DEFAULT_DEBUG_LEVEL: "${{ inputs.debug_info_level || 'debug_level_1' }}"
+      JAVA_RBE_MODE: "dex"
+      SOONG_GOGC: "45"
+      SOONG_GOMEMLIMIT: "6GiB"
+      CHECKPOINT_KEY: "${{ inputs.checkpoint_key }}"
+      CHECKPOINT_PREFIX: "${{ inputs.checkpoint_prefix }}"
+      CHECKPOINT_SUBVOL: "${{ inputs.checkpoint_subvol }}"
+      EXPECTED_CHECKPOINT_BYTES: "${{ inputs.checkpoint_bytes }}"
+      ORIGIN_RUN_ID: "${{ inputs.origin_run_id }}"
+      ORIGIN_RUN_ATTEMPT: "${{ inputs.origin_run_attempt }}"
+
+      R2_ACCOUNT_ID: "${{ secrets.R2_ACCOUNT_ID }}"
+      R2_ACCESS_KEY_ID: "${{ secrets.R2_ACCESS_KEY_ID }}"
+      R2_SECRET_ACCESS_KEY: "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+      R2_BUCKET: "${{ secrets.R2_BUCKET }}"
+      RCLONE_CONFIG_R2_TYPE: "s3"
+      RCLONE_CONFIG_R2_PROVIDER: "Cloudflare"
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: "${{ secrets.R2_ACCESS_KEY_ID }}"
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+      RCLONE_CONFIG_R2_ENDPOINT: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+      RCLONE_CONFIG_R2_REGION: "auto"
+      PINNED_RCLONE_VERSION: "1.75.2"
+
+      USE_RBE: "true"
+      USE_REWRAPPER: "true"
+      RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
+      RBE_R8: "1"
+      RBE_D8: "1"
+      RBE_JAVAC: "false"
+      RBE_R8_EXEC_STRATEGY: "remote_local_fallback"
+      RBE_D8_EXEC_STRATEGY: "remote_local_fallback"
+      RBE_JAVAC_EXEC_STRATEGY: "local"
+      RBE_service: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
+      RBE_service_no_security: "true"
+      RBE_service_no_auth: "true"
+      RBE_use_application_default_credentials: "false"
+      RBE_use_gce_credentials: "false"
+      RBE_use_rpc_credentials: "false"
+      RBE_depsscanner_address: "execrel://"
+      RBE_log_dir: "/tmp/rbe-test"
+      RBE_proxy_log_dir: "/tmp/rbe-test"
+      RBE_output_dir: "/tmp/rbe-test"
+      RBE_reproxy_wait_seconds: "30"
+      RBE_v: "0"
+      NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
+      NINJA_HIGHMEM_NUM_JOBS: "1"
+      LOCAL_NINJA_JOBS: "3"
+      SOONG_ZRAM_GIB: "8"
+      SOONG_DISK_SWAP_GIB: "12"
+      SOONG_SWAP_DISK_RESERVE_GIB: "10"
+      RESUME_SOFT_DEADLINE_MINUTES: "325"
+
+    steps:
+      - name: Reclaim root disk for resume runner
+        shell: bash
+        run: |
+          set -e
+          sudo swapoff -a || true
+          sudo rm -f /swapfile /build-swap /mnt/swapfile /mnt/soong-swap-base || true
+          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          sudo rm -rf \
+            /var/lib/docker /var/lib/containerd /var/cache/apt/archives/* \
+            /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/lib/node_modules /usr/local/graalvm \
+            /usr/share/rust /usr/share/php* /usr/local/share/chromium \
+            /usr/share/miniconda /usr/local/aws-cli /usr/local/aws-sam-cli \
+            /usr/local/share/vcpkg /opt/google /opt/microsoft /usr/share/postgresql \
+            /usr/share/mysql /usr/local/julia* || true
+          mkdir -p /home/runner/work/los
+          sudo install -d -m 0755 /mnt/los-btrfs
+          date +%s > /tmp/job-b-start-epoch.txt
+          df -h /
+          free -h
+
+      - name: Install resume runner dependencies and pinned rclone
+        working-directory: /home/runner/work
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential curl flex g++-multilib gcc-multilib git git-lfs \
+            gnupg gperf imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools btrfs-progs xsltproc zip zlib1g-dev zstd python3 python-is-python3 \
+            openjdk-21-jdk-headless ninja-build nginx ca-certificates openssl unzip
+
+          # Optional on GitHub-hosted kernels; do not let failure mask required packages.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            "linux-modules-extra-$(uname -r)" || true
+
+          RCLONE_ZIP="/tmp/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip"
+          RCLONE_SUMS="/tmp/rclone-v${PINNED_RCLONE_VERSION}-SHA256SUMS"
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip" \
+            -o "$RCLONE_ZIP"
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/SHA256SUMS" \
+            -o "$RCLONE_SUMS"
+          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
+          test -n "$EXPECTED_RCLONE_SHA"
+          printf '%s  %s\n' "$EXPECTED_RCLONE_SHA" "$RCLONE_ZIP" | sha256sum -c -
+          rm -rf /tmp/rclone-pinned
+          mkdir -p /tmp/rclone-pinned
+          unzip -q "$RCLONE_ZIP" -d /tmp/rclone-pinned
+          RCLONE_BIN="$(find /tmp/rclone-pinned -type f -name rclone -perm -u+x | head -1)"
+          test -n "$RCLONE_BIN"
+          sudo install -m 0755 "$RCLONE_BIN" /usr/local/bin/rclone
+
+          for tool in rclone btrfs zstd nginx; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool missing after dependency installation: $tool"
+              exit 1
+            fi
+          done
+          test "$(rclone version | head -1)" = "rclone v${PINNED_RCLONE_VERSION}"
+          rclone version | head -4
+          btrfs version
+          zstd --version
+
+      - name: Validate R2 handoff object
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CHECKPOINT_KEY"
+          test -n "$CHECKPOINT_PREFIX"
+          test -n "$CHECKPOINT_SUBVOL"
+          rclone lsf "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}" --files-only | tee /tmp/r2-resume-list.txt
+          rclone size "r2:${R2_BUCKET}/${CHECKPOINT_KEY}" --json | tee /tmp/r2-checkpoint-size.json
+          ACTUAL="$(python3 -c 'import json; print(json.load(open("/tmp/r2-checkpoint-size.json")).get("bytes",0))')"
+          if [ "$ACTUAL" != "$EXPECTED_CHECKPOINT_BYTES" ]; then
+            echo "::error::R2 checkpoint size mismatch: expected=$EXPECTED_CHECKPOINT_BYTES actual=$ACTUAL"
+            exit 1
+          fi
+
+      - name: Stream Btrfs checkpoint from R2 and restore writable workspace
+        working-directory: /home/runner/work
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE=/home/runner/work/los
+          TOP="${BTRFS_TOP_MOUNT}"
+          BACKING=/tmp/los-workspace-btrfs.img
+          mkdir -p "$WORKSPACE"
+          sudo install -d -m 0755 "$TOP"
+          test -z "$(ls -A "$WORKSPACE")"
+          truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
+          sudo mkfs.btrfs -f -m single -d single "$BACKING" >/tmp/btrfs-job-b-mkfs.log 2>&1
+          sudo mount -t btrfs -o "loop,compress=zstd:${BTRFS_ZSTD_LEVEL},noatime,subvolid=5" \
+            "$BACKING" "$TOP"
+
+          rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}/checkpoint-a.sha256" \
+            > /tmp/checkpoint-a-expected.sha256
+          HASHER=$'import hashlib,sys\nh=hashlib.sha256()\ni=sys.stdin.buffer\no=sys.stdout.buffer\nf=sys.argv[1]\nwhile True:\n    b=i.read(8*1024*1024)\n    if not b: break\n    h.update(b)\n    o.write(b)\n    o.flush()\nopen(f,"w").write(h.hexdigest()+"\\n")'
+          set -o pipefail
+          rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_KEY}" --stats 30s --stats-one-line \
+            | python3 -c "$HASHER" /tmp/checkpoint-a-received.sha256 \
+            | sudo btrfs receive "$TOP" | tee /tmp/btrfs-receive.log
+          cmp -s /tmp/checkpoint-a-expected.sha256 /tmp/checkpoint-a-received.sha256 || {
+            echo '::error::Checkpoint SHA256 mismatch after R2 download.'
+            echo "expected=$(cat /tmp/checkpoint-a-expected.sha256)"
+            echo "received=$(cat /tmp/checkpoint-a-received.sha256)"
+            exit 1
+          }
+
+          RECEIVED="$TOP/$CHECKPOINT_SUBVOL"
+          test -d "$RECEIVED"
+          sudo btrfs subvolume show "$RECEIVED" | tee /tmp/btrfs-received-subvolume.txt
+          if [ -e "$TOP/@los" ]; then
+            echo '::error::Writable @los unexpectedly exists before restore snapshot.'
+            exit 1
+          fi
+          sudo btrfs subvolume snapshot "$RECEIVED" "$TOP/@los" | tee /tmp/btrfs-job-b-writable-snapshot.log
+          sudo chown "$(id -u):$(id -g)" "$TOP/@los"
+          sudo mount --bind "$TOP/@los" "$WORKSPACE"
+          test "$(stat -f -c '%T' "$WORKSPACE")" = btrfs
+          df -hT / "$TOP" "$WORKSPACE"
+          sudo btrfs filesystem usage -b "$TOP" | head -80
+
+      - name: Reattach diagnostics and verify checkpoint identity
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          META=.ci-checkpoint/metadata.json
+          test -s "$META"
+          python3 - "$META" <<'PYVERIFY'
+          import json, os, sys
+          d=json.load(open(sys.argv[1]))
+          checks={
+            'branch': os.environ['LINEAGE_BRANCH'],
+            'device': 'starlte',
+            'target': 'bacon',
+            'github_run_id': os.environ['ORIGIN_RUN_ID'],
+            'github_run_attempt': os.environ['ORIGIN_RUN_ATTEMPT'],
+            'checkpoint_prefix': os.environ['CHECKPOINT_PREFIX'],
+          }
+          bad=[]
+          for k,v in checks.items():
+              if str(d.get(k,'')) != str(v): bad.append((k,d.get(k),v))
+          if bad: raise SystemExit('Checkpoint identity mismatch: '+repr(bad))
+          print(json.dumps(d, indent=2, sort_keys=True))
+          PYVERIFY
+          rm -rf /tmp/rbe-test
+          mkdir -p rbe-diagnostics
+          ln -s "$PWD/rbe-diagnostics" /tmp/rbe-test
+          printf 'restored_at=%s\ncheckpoint_key=%s\ncheckpoint_bytes=%s\norigin_run_id=%s\norigin_run_attempt=%s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$CHECKPOINT_KEY" "$EXPECTED_CHECKPOINT_BYTES" \
+            "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" > /tmp/rbe-test/job-b-restore.txt
+
+      - name: Record verified streamed checkpoint SHA256
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/checkpoint-a-expected.sha256
+          test -s /tmp/checkpoint-a-received.sha256
+          cmp -s /tmp/checkpoint-a-expected.sha256 /tmp/checkpoint-a-received.sha256
+          cp /tmp/checkpoint-a-expected.sha256 /tmp/rbe-test/checkpoint-a-expected.sha256
+          cp /tmp/checkpoint-a-received.sha256 /tmp/rbe-test/checkpoint-a-received.sha256
+          echo "Verified checkpoint SHA256: $(cat /tmp/checkpoint-a-received.sha256)"
+
+      - name: Install and verify legacy ncurses5 for restored RenderScript tools
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=6.3-2ubuntu0.3
+          BASE=https://security.ubuntu.com/ubuntu/pool/universe/n/ncurses
+          PKG_DIR="$RUNNER_TEMP/ncurses5-jammy"
+          mkdir -p "$PKG_DIR"
+          NCURSES_SHA=58da01991712c6856af0658dc5e9cb533c1a6854ab950055ade185e35bc9c276
+          TINFO_SHA=4df4288404108f1a156d014e8764a064e977e34e6d44931ab60451694c03c90d
+          for pkg in libtinfo5 libncurses5; do
+            file="${pkg}_${VERSION}_amd64.deb"
+            curl --fail --location --show-error --silent --retry 3 --connect-timeout 15 --max-time 90 \
+              "$BASE/$file" -o "$PKG_DIR/$file"
+          done
+          printf '%s  %s\n%s  %s\n' \
+            "$TINFO_SHA" "$PKG_DIR/libtinfo5_${VERSION}_amd64.deb" \
+            "$NCURSES_SHA" "$PKG_DIR/libncurses5_${VERSION}_amd64.deb" | sha256sum --check --status
+          sudo dpkg -i "$PKG_DIR/libtinfo5_${VERSION}_amd64.deb" "$PKG_DIR/libncurses5_${VERSION}_amd64.deb"
+          sudo ldconfig
+
+      - name: Resolve restored reclient snapshot
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          RBE_DIR_FOUND="$(find prebuilts/remoteexecution-client -maxdepth 1 -type d -name 'compat-*' -print | sort -V | tail -1)"
+          test -n "$RBE_DIR_FOUND"
+          test -x "$RBE_DIR_FOUND/rewrapper"
+          test -x "$RBE_DIR_FOUND/reproxy"
+          test -x "$RBE_DIR_FOUND/bootstrap"
+          echo "RBE_DIR=$RBE_DIR_FOUND" >> "$GITHUB_ENV"
+          echo "RBE_WRAPPER=$RBE_DIR_FOUND/rewrapper" >> "$GITHUB_ENV"
+          cat "$RBE_DIR_FOUND/version.txt" | tee /tmp/rbe-test/job-b-reclient-version.txt
+
+      - name: Configure hybrid ZRAM and disk swap for resume
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          BASE_SWAP=/mnt/soong-swap-base
+          sudo modprobe zram num_devices=1 2>/tmp/rbe-test/zram-resume-errors.log || true
+          zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" 2>>/tmp/rbe-test/zram-resume-errors.log || true)"
+          if [ -n "$zram_dev" ] && [ -b "$zram_dev" ]; then
+            sudo mkswap -f "$zram_dev" >/dev/null
+            sudo swapon --priority 100 "$zram_dev"
+          fi
+          disk_free_gib=$(( $(df -B1 --output=avail /mnt | tail -1 | tr -d ' ') / 1073741824 ))
+          target="${SOONG_DISK_SWAP_GIB}"
+          if (( disk_free_gib - SOONG_SWAP_DISK_RESERVE_GIB < target )); then
+            target=$((disk_free_gib - SOONG_SWAP_DISK_RESERVE_GIB))
+          fi
+          if (( target >= 4 )); then
+            sudo fallocate -l "${target}G" "$BASE_SWAP"
+            sudo chmod 600 "$BASE_SWAP"
+            sudo mkswap "$BASE_SWAP" >/dev/null
+            sudo swapon --priority 20 "$BASE_SWAP"
+          fi
+          sudo sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
+          swapon --show
+          free -h
+          if ! swapon --noheadings --show=NAME | grep -q .; then
+            echo '::error::No active swap on resume runner.'
+            exit 1
+          fi
+
+      - name: Check BuildBuddy network connectivity on resume runner
+        shell: bash
+        run: |
+          set -e
+          getent hosts remote.buildbuddy.io
+          timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
+
+      - name: Start authenticated BuildBuddy gRPC bridge for resume
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRIDGE_DIR=/tmp/buildbuddy-rbe-bridge
+          install -d -m 700 "$BRIDGE_DIR" /tmp/rbe-test
+          umask 077
+          python3 - <<'PYBRIDGE2'
+          import os
+          from pathlib import Path
+          secret=os.environ['BUILDBUDDY_API_KEY']
+          if not secret or any(ch in secret for ch in ('\n','\r','\x00')):
+              raise SystemExit('Invalid BuildBuddy API key format')
+          encoded=secret.replace('\\','\\\\').replace('"','\\"')
+          cfg='''worker_processes auto;
+          pid /tmp/buildbuddy-rbe-bridge/nginx.pid;
+          error_log /tmp/rbe-test/buildbuddy-grpc-errors-job-b.log warn;
+          events { worker_connections 2048; }
+          http {
+            log_format rbe_fmt '$time_iso8601 $status $request_length bytes -> grpc_status=$upstream_trailer_grpc_status';
+            access_log /tmp/rbe-test/nginx-access-job-b.log rbe_fmt;
+            client_max_body_size 0;
+            server {
+              listen unix:/tmp/buildbuddy-rbe-bridge/grpc.sock http2;
+              server_name localhost;
+              location / {
+                grpc_pass grpcs://remote.buildbuddy.io:443;
+                grpc_ssl_server_name on;
+                grpc_ssl_name remote.buildbuddy.io;
+                grpc_ssl_verify on;
+                grpc_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                grpc_connect_timeout 30s;
+                grpc_read_timeout 300s;
+                grpc_send_timeout 300s;
+                grpc_set_header x-buildbuddy-api-key "__KEY__";
+              }
+            }
+          }
+          '''.replace('__KEY__',encoded)
+          Path('/tmp/buildbuddy-rbe-bridge/nginx.conf').write_text(cfg)
+          PYBRIDGE2
+          nginx -t -c "$BRIDGE_DIR/nginx.conf"
+          nginx -c "$BRIDGE_DIR/nginx.conf"
+          for _ in $(seq 1 20); do [ -S "$BRIDGE_DIR/grpc.sock" ] && exit 0; sleep 1; done
+          echo '::error::Resume BuildBuddy bridge failed to start.'
+          exit 1
+
+      - name: Resume LineageOS bacon from restored Ninja state
+        id: resume_build
+        working-directory: /home/runner/work/los
+        timeout-minutes: 340
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Android envsetup is not nounset-safe; temporarily disable -u while sourcing.
+          set +u
+          source build/envsetup.sh
+          set -u
+          TARGET_REL="${LINEAGE_RELEASE_CONFIG:-}"
+          if [ -z "$TARGET_REL" ]; then
+            if [ -s vendor/lineage/vars/aosp_target_release.mk ]; then
+              TARGET_REL="$(sed -nE 's/^[[:space:]]*lineage_current_release[[:space:]]*:?=[[:space:]]*([a-zA-Z0-9_]+).*/\1/p' vendor/lineage/vars/aosp_target_release.mk | head -1)"
+            fi
+          fi
+          TARGET_REL="${TARGET_REL:-bp1a}"
+          if declare -F breakfast >/dev/null 2>&1; then
+            breakfast starlte userdebug || lunch "lineage_starlte-${TARGET_REL}-userdebug"
+          else
+            lunch "lineage_starlte-${TARGET_REL}-userdebug"
+          fi
+
+          if [ -x "$PWD/prebuilts/jdk/jdk21/linux-x86/bin/java" ]; then
+            BUNDLED_JDK="$PWD/prebuilts/jdk/jdk21/linux-x86"
+          else
+            BUNDLED_JDK="$PWD/prebuilts/jdk/jdk17/linux-x86"
+          fi
+          export JAVA_HOME="$BUNDLED_JDK" ANDROID_JAVA_HOME="$BUNDLED_JDK"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          export _JAVA_OPTIONS='-Xmx3584m' JAVA_TOOL_OPTIONS='-Xmx3584m'
+          export USE_CCACHE=0 CCACHE_DISABLE=1
+          export GOGC="$SOONG_GOGC"
+          export GOMEMLIMIT="$SOONG_GOMEMLIMIT"
+          export RBE_exec_root="$(dirname "$(pwd -P)")"
+          export RBE_WRAPPER="$RBE_DIR/rewrapper"
+          test "$(realpath --relative-to="$RBE_exec_root" "$PWD")" = los
+
+          SOONG_VARIABLES="$(find out/soong -maxdepth 1 -type f -name 'soong*.variables' -print | head -1)"
+          test -s "$SOONG_VARIABLES"
+          python3 - "$SOONG_VARIABLES" <<'PYVARS2'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          required=('UseRBE','UseREWrapper','UseRBER8','UseRBED8')
+          bad=[k for k in required if d.get(k) is not True]
+          if bad: raise SystemExit('Restored P0 gates missing: '+','.join(bad))
+          if d.get('UseRBEJAVAC') is True: raise SystemExit('Restored checkpoint unexpectedly has Javac RBE enabled')
+          print('restored_soong_variables_ok', {k:d.get(k) for k in (*required,'UseRBEJAVAC')})
+          PYVARS2
+
+          START="$(cat /tmp/job-b-start-epoch.txt)"
+          DEADLINE=$((START + RESUME_SOFT_DEADLINE_MINUTES * 60))
+          LOG=/tmp/rbe-test/resume-full-rom-build.log
+          STATUS=/tmp/rbe-test/resume-build-status.txt
+          : > "$LOG"
+          (
+            set +e
+            set -o pipefail
+            m -j"${LOCAL_NINJA_JOBS}" --skip-soong-tests bacon 2>&1 | tee "$LOG"
+            echo "${PIPESTATUS[0]}" > "$STATUS"
+          ) &
+          PID=$!
+          stop_tree() {
+            local p="$1" c
+            while IFS= read -r c; do [ -n "$c" ] && stop_tree "$c"; done < <(pgrep -P "$p" 2>/dev/null || true)
+            kill -TERM "$p" 2>/dev/null || true
+          }
+          while kill -0 "$PID" 2>/dev/null; do
+            now="$(date +%s)"
+            progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$LOG" | tail -1 || true)"
+            reqs="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
+            echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') resume progress=${progress:-unknown} rbe_grpc_requests=$reqs free_gib=$(( $(df -B1 --output=avail . | tail -1 | tr -d ' ') / 1073741824 ))"
+            if (( now >= DEADLINE )); then
+              echo '::error::Job B resume soft deadline reached before ROM completion.'
+              stop_tree "$PID"
+              break
+            fi
+            sleep 30
+          done
+          set +e
+          wait "$PID"
+          WAIT_RC=$?
+          set -e
+          RC="$WAIT_RC"
+          [ -s "$STATUS" ] && RC="$(cat "$STATUS")"
+          if [ "$RC" -ne 0 ]; then
+            tail -n 220 "$LOG" || true
+            exit "$RC"
+          fi
+
+          ROM_DIR=out/target/product/starlte
+          ROM_ZIP="$(find "$ROM_DIR" -maxdepth 1 -type f -name 'lineage-*.zip' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+          test -s "$ROM_ZIP"
+          unzip -tq "$ROM_ZIP" | tail -8
+          sha256sum "$ROM_ZIP" | tee /tmp/rbe-test/resumed-rom-sha256.txt
+          echo "rom_zip=$ROM_ZIP" >> "$GITHUB_OUTPUT"
+          echo 'completed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Upload resumed LineageOS ROM
+        if: ${{ steps.resume_build.outputs.completed == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.lineage_branch }}-starlte-resumed-${{ github.run_id }}
+          path: /home/runner/work/los/out/target/product/starlte/lineage-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Delete ephemeral R2 checkpoint after verified ROM upload
+        if: ${{ success() && steps.resume_build.outputs.completed == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Deleting unique checkpoint prefix: ${CHECKPOINT_PREFIX}"
+          rclone purge "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}"
+          if rclone lsf "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}" --max-depth 1 2>/dev/null | grep -q .; then
+            echo '::error::Checkpoint prefix still contains objects after purge.'
+            exit 1
+          fi
+          echo 'Ephemeral R2 checkpoint deleted after successful ROM upload.'
+
+      - name: Upload Job B resume diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /home/runner/work/los/resume-diagnostics
+          SRC=/tmp/rbe-test
+          DST=/home/runner/work/los/resume-diagnostics
+          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resumed-rom-sha256.txt nginx-access-job-b.log buildbuddy-grpc-errors-job-b.log; do
+            [ -f "$SRC/$f" ] || continue
+            if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
+              tail -c 6291456 "$SRC/$f" > "$DST/$f"
+            else
+              cp "$SRC/$f" "$DST/$f"
+            fi
+          done
+
+      - name: Publish Job B diagnostics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2-resume-logs-${{ github.run_id }}
+          path: /home/runner/work/los/resume-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Stop resume RBE bridge and unmount workspace
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cd /home/runner/work/los 2>/dev/null || true
+          if pgrep -x reproxy >/dev/null && [ -n "${RBE_DIR:-}" ] && [ -x "${RBE_DIR}/bootstrap" ]; then
+            timeout 60s "${RBE_DIR}/bootstrap" -shutdown -output_dir=/tmp/rbe-test >/tmp/reproxy-job-b-finalize.log 2>&1 || true
+          fi
+          CFG=/tmp/buildbuddy-rbe-bridge/nginx.conf
+          [ -f "$CFG" ] && nginx -s quit -c "$CFG" >/dev/null 2>&1 || true
+          sync
+          mountpoint -q /home/runner/work/los && sudo umount /home/runner/work/los || true
+          mountpoint -q "${BTRFS_TOP_MOUNT}" && sudo umount "${BTRFS_TOP_MOUNT}" || true
+          rm -f /tmp/los-workspace-btrfs.img
