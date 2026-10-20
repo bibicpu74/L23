@@ -447,7 +447,7 @@ jobs:
           echo '::error::Resume BuildBuddy bridge failed to start.'
           exit 1
 
-      - name: Probe Job B RBE and select remote or local-only execution
+      - name: Probe Job B RBE and select remote or direct-local execution
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -460,43 +460,75 @@ jobs:
           test -x "$RBE_DIR/reproxy"
           test -x "$RBE_DIR/bootstrap"
 
-          cat > /tmp/enable-job-b-local-rewrapper.sh <<'LOCALHELPER'
+          # rewrapper --exec_strategy=local is still LERC and talks to reproxy.
+          # This fallback must bypass rewrapper/reproxy entirely.
+          cat > /tmp/enable-job-b-direct-local-rewrapper.sh <<'LOCALHELPER'
           #!/usr/bin/env bash
           set -euo pipefail
           WRAPPER="${RBE_WRAPPER:?RBE_WRAPPER is required}"
           REAL="${WRAPPER}.remote-real"
+
           if [ -x "$REAL" ]; then
-            echo "Job-B local rewrapper shim already enabled: $WRAPPER"
+            echo "Job-B direct-local rewrapper shim already enabled: $WRAPPER"
             exit 0
           fi
+
           test -x "$WRAPPER"
           mv "$WRAPPER" "$REAL"
+
           cat > "$WRAPPER" <<'PYSHIM'
           #!/usr/bin/env python3
-          import os, sys
-          wrapper = os.path.abspath(sys.argv[0])
-          real = wrapper + ".remote-real"
-          src = sys.argv[1:]
-          out = []
-          i = 0
-          while i < len(src):
-              arg = src[i]
-              if arg.startswith("--exec_strategy="):
-                  out.append("--exec_strategy=local")
-              elif arg == "--exec_strategy":
-                  out.extend(["--exec_strategy", "local"])
-                  if i + 1 < len(src):
-                      i += 1
-              else:
-                  out.append(arg)
-              i += 1
-          os.execv(real, [real] + out)
+          import os
+          import sys
+
+          args = sys.argv[1:]
+          try:
+              sep = args.index("--")
+          except ValueError:
+              sys.stderr.write("direct-local rewrapper shim: missing '--' command separator\\n")
+              sys.exit(64)
+
+          cmd = args[sep + 1:]
+          if not cmd:
+              sys.stderr.write("direct-local rewrapper shim: empty wrapped command\\n")
+              sys.exit(64)
+
+          os.execvp(cmd[0], cmd)
           PYSHIM
+
           chmod 0755 "$WRAPPER"
           touch -r "$REAL" "$WRAPPER"
-          echo "Enabled Job-B local-only rewrapper shim: $WRAPPER -> $REAL"
+          echo "Enabled Job-B DIRECT local rewrapper shim: $WRAPPER (saved remote binary: $REAL)"
           LOCALHELPER
-          chmod 0755 /tmp/enable-job-b-local-rewrapper.sh
+          chmod 0755 /tmp/enable-job-b-direct-local-rewrapper.sh
+
+          run_direct_local_probe() {
+            local out=out/job-b-direct-local-smoke.txt
+            local log=/tmp/rbe-test/job-b-direct-local-smoke.log
+            rm -f "$out"
+
+            set +e
+            timeout 30s "$RBE_WRAPPER" \
+              --server_address=unix:///tmp/this-socket-must-not-be-used.sock \
+              --labels=type=tool,name=job-b-direct-local-probe \
+              --exec_root="$EXEC_ROOT" \
+              --inputs="${REL_WORKDIR}/build/soong/remoteexec/remoteexec.go" \
+              --exec_strategy=remote \
+              --remote_accept_cache=false \
+              --exec_timeout=20s \
+              --output_files="${REL_WORKDIR}/${out}" \
+              -- /bin/sh -c 'mkdir -p out && printf "job-b-direct-local-ok\\n" > out/job-b-direct-local-smoke.txt' \
+              > "$log" 2>&1
+            local rc=$?
+            set -e
+
+            if [ "$rc" -ne 0 ] || [ ! -s "$out" ] || \
+               ! grep -Fxq 'job-b-direct-local-ok' "$out"; then
+              cat "$log" || true
+              return 1
+            fi
+            return 0
+          }
 
           IMAGE="$(python3 - <<'P0IMAGE'
           import pathlib, re
@@ -512,14 +544,18 @@ jobs:
           SMOKE_PROXY="unix://${SMOKE_SOCKET}"
           SMOKE_INPUT="${REL_WORKDIR}/build/soong/remoteexec/remoteexec.go"
           REMOTE_OUT=out/job-b-rbe-remote-smoke.txt
-          LOCAL_OUT=out/job-b-rbe-local-smoke.txt
           REMOTE_LOG=/tmp/rbe-test/job-b-rbe-remote-smoke.log
-          LOCAL_LOG=/tmp/rbe-test/job-b-rbe-local-smoke.log
           BOOT_LOG=/tmp/rbe-test/job-b-rbe-smoke-bootstrap.log
           STATUS_LOG=/tmp/rbe-test/job-b-rbe-mode.txt
 
-          rm -f "$SMOKE_SOCKET" "$REMOTE_OUT" "$LOCAL_OUT"
+          rm -f "$SMOKE_SOCKET" "$REMOTE_OUT"
           test -s "$EXEC_ROOT/$SMOKE_INPUT"
+
+          REMOTE_OK=0
+          BOOT_RC=1
+          REMOTE_RC=125
+          REQS_BEFORE=0
+          REQS_AFTER=0
 
           set +e
           RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
@@ -531,81 +567,66 @@ jobs:
           BOOT_RC=$?
           set -e
 
-          if [ "$BOOT_RC" -ne 0 ] || [ ! -S "$SMOKE_SOCKET" ]; then
-            cat "$BOOT_LOG" || true
-            printf 'mode=failed\nreason=probe_bootstrap_failed\nbootstrap_rc=%s\n' "$BOOT_RC" > "$STATUS_LOG"
-            echo '::error::Dedicated reproxy probe could not start. This is a local reclient/bootstrap failure, so local-only rewrapper cannot be trusted either.'
-            exit 74
-          fi
-
-          REQS_BEFORE="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
-          set +e
-          timeout 150s "$RBE_WRAPPER" \
-            --server_address="$SMOKE_PROXY" \
-            --labels=type=tool,name=job-b-rbe-probe \
-            --exec_root="$EXEC_ROOT" \
-            --inputs="$SMOKE_INPUT" \
-            --platform="container-image=$IMAGE" \
-            --exec_strategy=remote \
-            --remote_accept_cache=false \
-            --exec_timeout=90s \
-            --output_files="${REL_WORKDIR}/${REMOTE_OUT}" \
-            -- /bin/sh -c 'mkdir -p out && printf "job-b-rbe-remote-ok\\n" > out/job-b-rbe-remote-smoke.txt' \
-            > "$REMOTE_LOG" 2>&1
-          REMOTE_RC=$?
-          set -e
-          REQS_AFTER="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
-
-          if [ "$REMOTE_RC" -eq 0 ] && \
-             [ "$REQS_AFTER" -gt "$REQS_BEFORE" ] && \
-             [ -s "$REMOTE_OUT" ] && \
-             grep -Fxq 'job-b-rbe-remote-ok' "$REMOTE_OUT"; then
-            echo "JOB_B_RBE_MODE=remote" >> "$GITHUB_ENV"
-            printf 'mode=remote\nremote_rc=0\nrequests_before=%s\nrequests_after=%s\n' \
-              "$REQS_BEFORE" "$REQS_AFTER" > "$STATUS_LOG"
-            echo 'Job-B remote-only RBE smoke PASS; keeping remote execution enabled.'
-          else
-            echo '::warning::Job-B remote-only RBE smoke failed; validating local-only rewrapper fallback.'
-            cat "$REMOTE_LOG" || true
-            /tmp/enable-job-b-local-rewrapper.sh
-
+          if [ "$BOOT_RC" -eq 0 ] && [ -S "$SMOKE_SOCKET" ]; then
+            REQS_BEFORE="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
             set +e
-            timeout 120s "$RBE_WRAPPER" \
+            timeout 150s "$RBE_WRAPPER" \
               --server_address="$SMOKE_PROXY" \
-              --labels=type=tool,name=job-b-local-fallback-probe \
+              --labels=type=tool,name=job-b-rbe-probe \
               --exec_root="$EXEC_ROOT" \
               --inputs="$SMOKE_INPUT" \
               --platform="container-image=$IMAGE" \
               --exec_strategy=remote \
               --remote_accept_cache=false \
-              --exec_timeout=60s \
-              --output_files="${REL_WORKDIR}/${LOCAL_OUT}" \
-              -- /bin/sh -c 'mkdir -p out && printf "job-b-rbe-local-ok\\n" > out/job-b-rbe-local-smoke.txt' \
-              > "$LOCAL_LOG" 2>&1
-            LOCAL_RC=$?
+              --exec_timeout=90s \
+              --output_files="${REL_WORKDIR}/${REMOTE_OUT}" \
+              -- /bin/sh -c 'mkdir -p out && printf "job-b-rbe-remote-ok\\n" > out/job-b-rbe-remote-smoke.txt' \
+              > "$REMOTE_LOG" 2>&1
+            REMOTE_RC=$?
             set -e
+            REQS_AFTER="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
 
-            if [ "$LOCAL_RC" -ne 0 ] || [ ! -s "$LOCAL_OUT" ] || \
-               ! grep -Fxq 'job-b-rbe-local-ok' "$LOCAL_OUT"; then
-              cat "$LOCAL_LOG" || true
-              echo '::error::Both remote RBE and local-only rewrapper fallback probes failed.'
-              RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
-                -server_address="$SMOKE_PROXY" -shutdown -output_dir=/tmp/rbe-test \
-                >/tmp/rbe-test/job-b-rbe-smoke-shutdown.log 2>&1 || true
+            if [ "$REMOTE_RC" -eq 0 ] && \
+               [ "$REQS_AFTER" -gt "$REQS_BEFORE" ] && \
+               [ -s "$REMOTE_OUT" ] && \
+               grep -Fxq 'job-b-rbe-remote-ok' "$REMOTE_OUT"; then
+              REMOTE_OK=1
+            fi
+          else
+            echo "::warning::Dedicated remote RBE probe reproxy did not start; falling back to direct-local execution."
+            cat "$BOOT_LOG" || true
+          fi
+
+          if [ "$BOOT_RC" -eq 0 ] && [ -S "$SMOKE_SOCKET" ]; then
+            RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
+              -server_address="$SMOKE_PROXY" \
+              -shutdown -output_dir=/tmp/rbe-test \
+              >/tmp/rbe-test/job-b-rbe-smoke-shutdown.log 2>&1 || true
+          fi
+          rm -f "$SMOKE_SOCKET"
+
+          if [ "$REMOTE_OK" -eq 1 ]; then
+            echo "JOB_B_RBE_MODE=remote" >> "$GITHUB_ENV"
+            printf 'mode=remote\nbootstrap_rc=%s\nremote_rc=%s\nrequests_before=%s\nrequests_after=%s\n' \
+              "$BOOT_RC" "$REMOTE_RC" "$REQS_BEFORE" "$REQS_AFTER" > "$STATUS_LOG"
+            echo 'Job-B remote-only RBE smoke PASS; keeping remote execution enabled.'
+          else
+            echo '::warning::Job-B remote RBE unavailable; switching to true direct-local wrapper.'
+            [ -s "$REMOTE_LOG" ] && cat "$REMOTE_LOG" || true
+
+            /tmp/enable-job-b-direct-local-rewrapper.sh
+
+            if ! run_direct_local_probe; then
+              echo '::error::Direct-local rewrapper shim probe failed.'
               exit 74
             fi
 
-            echo "JOB_B_RBE_MODE=local" >> "$GITHUB_ENV"
-            printf 'mode=local\nremote_rc=%s\nlocal_rc=0\nrequests_before=%s\nrequests_after=%s\nreason=remote_probe_failed\n' \
-              "$REMOTE_RC" "$REQS_BEFORE" "$REQS_AFTER" > "$STATUS_LOG"
-            echo 'Job-B local-only rewrapper fallback PASS; build will continue without remote execution.'
+            echo "JOB_B_RBE_MODE=direct-local" >> "$GITHUB_ENV"
+            printf 'mode=direct-local\nbootstrap_rc=%s\nremote_rc=%s\nrequests_before=%s\nrequests_after=%s\nreason=remote_probe_failed\n' \
+              "$BOOT_RC" "$REMOTE_RC" "$REQS_BEFORE" "$REQS_AFTER" > "$STATUS_LOG"
+            echo 'Job-B DIRECT local fallback PASS; remaining wrapped actions will bypass reproxy/RBE.'
           fi
 
-          RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
-            -server_address="$SMOKE_PROXY" \
-            -shutdown -output_dir=/tmp/rbe-test \
-            >/tmp/rbe-test/job-b-rbe-smoke-shutdown.log 2>&1 || true
-          rm -f "$SMOKE_SOCKET"
           cat "$STATUS_LOG"
 
       - name: Resume LineageOS bacon from restored Ninja state
@@ -753,14 +774,14 @@ jobs:
 
               # Reload nginx to refresh upstream DNS/TLS state without destroying the restored workspace.
               if [ "${JOB_B_RBE_MODE:-remote}" = "remote" ]; then
-                echo "::warning::Remote RBE degraded after the preflight; switching all baked rewrapper actions to local-only for the next incremental attempt."
-                /tmp/enable-job-b-local-rewrapper.sh
-                export JOB_B_RBE_MODE=local
-                echo "JOB_B_RBE_MODE=local" >> "$GITHUB_ENV"
+                echo "::warning::Remote RBE degraded after the preflight; switching all baked rewrapper actions to TRUE direct-local execution for the next incremental attempt."
+                /tmp/enable-job-b-direct-local-rewrapper.sh
+                export JOB_B_RBE_MODE=direct-local
+                echo "JOB_B_RBE_MODE=direct-local" >> "$GITHUB_ENV"
                 printf 'runtime_fallback_attempt=%s\nruntime_fallback_reason=transient_rbe_failure\n' \
                   "$ATTEMPT" >> /tmp/rbe-test/job-b-rbe-mode.txt
               else
-                echo '::error::A remote transport error was still observed while local-only mode was active; refusing an endless retry loop.'
+                echo '::error::A remote transport error was still observed while direct-local mode was active; refusing an endless retry loop.'
                 exit "$RC"
               fi
 
@@ -817,7 +838,7 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
-          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt nginx-access-job-b.log buildbuddy-grpc-errors-job-b.log tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-rbe-remote-smoke.log job-b-rbe-local-smoke.log job-b-rbe-smoke-bootstrap.log job-b-rbe-smoke-shutdown.log; do
+          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt nginx-access-job-b.log buildbuddy-grpc-errors-job-b.log tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-rbe-remote-smoke.log job-b-direct-local-smoke.log job-b-rbe-smoke-bootstrap.log job-b-rbe-smoke-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
