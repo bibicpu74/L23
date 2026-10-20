@@ -1,4 +1,4 @@
-name: LineageOS starlte - Resume existing R2 checkpoint
+name: LineageOS starlte - Resume existing R2 checkpoint1
 
 on:
   workflow_dispatch:
@@ -106,6 +106,8 @@ jobs:
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
       RCLONE_CONFIG_R2_REGION: "auto"
       PINNED_RCLONE_VERSION: "1.75.2"
+      RECLIENT_CIPD_VERSION: "latest"
+      PINNED_RECLIENT_PACKAGE: "infra/rbe/client/linux-amd64-csd"
 
       USE_RBE: "true"
       USE_REWRAPPER: "true"
@@ -346,6 +348,133 @@ jobs:
           echo "RBE_WRAPPER=$RBE_DIR_FOUND/rewrapper" >> "$GITHUB_ENV"
           cat "$RBE_DIR_FOUND/version.txt" | tee /tmp/rbe-test/job-b-reclient-version.txt
 
+      - name: Upgrade restored Reclient in-place for direct BuildBuddy auth
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "${RBE_DIR:-}"
+          test -d "$RBE_DIR"
+          test -x "$RBE_DIR/rewrapper"
+          test -x "$RBE_DIR/reproxy"
+          test -x "$RBE_DIR/bootstrap"
+
+          LOG=/tmp/rbe-test/job-b-reclient-upgrade.txt
+          mkdir -p /tmp/rbe-test
+          : > "$LOG"
+
+          {
+            echo "checkpoint_reclient_dir=$RBE_DIR"
+            echo "checkpoint_version_file=$(tr '\n' ' ' < "$RBE_DIR/version.txt" 2>/dev/null || true)"
+            echo "target_package=$PINNED_RECLIENT_PACKAGE"
+            echo "target_version=$RECLIENT_CIPD_VERSION"
+          } | tee -a "$LOG"
+
+          CIPD=/tmp/cipd-linux-amd64
+          NEW=/tmp/reclient-${RECLIENT_CIPD_VERSION}-csd
+          ENSURE=/tmp/reclient.ensure
+          CIPD_BOOT=/tmp/cipd-bootstrap
+          rm -rf "$NEW" "$CIPD_BOOT"
+          mkdir -p "$NEW" "$CIPD_BOOT"
+
+          # Bootstrap CIPD exactly like depot_tools:
+          # fetch its pinned client version + SHA256 digest, then request
+          # /client?platform=linux-amd64&version=<pinned version>.
+          DEPOT_BASE='https://chromium.googlesource.com/chromium/tools/depot_tools/+/refs/heads/main'
+          curl --fail --location --show-error --silent --retry 5 --retry-delay 2 \
+            "${DEPOT_BASE}/cipd_client_version?format=TEXT" \
+            | base64 -d > "$CIPD_BOOT/cipd_client_version"
+          curl --fail --location --show-error --silent --retry 5 --retry-delay 2 \
+            "${DEPOT_BASE}/cipd_client_version.digests?format=TEXT" \
+            | base64 -d > "$CIPD_BOOT/cipd_client_version.digests"
+
+          CIPD_CLIENT_VERSION="$(tr -d '\r\n' < "$CIPD_BOOT/cipd_client_version")"
+          CIPD_CLIENT_SHA="$(awk '$1=="linux-amd64" && $2=="sha256" {print $3; exit}' \
+            "$CIPD_BOOT/cipd_client_version.digests")"
+          test -n "$CIPD_CLIENT_VERSION"
+          test -n "$CIPD_CLIENT_SHA"
+
+          CIPD_CLIENT_VERSION_ESCAPED="$(python3 - "$CIPD_CLIENT_VERSION" <<'PYCIPD'
+          import sys, urllib.parse
+          print(urllib.parse.quote(sys.argv[1], safe=''))
+          PYCIPD
+          )"
+
+          curl --fail --location --show-error --silent --retry 5 --retry-delay 5 \
+            -A 'depot_tools/rbe-checkpoint-resume' \
+            "https://chrome-infra-packages.appspot.com/client?platform=linux-amd64&version=${CIPD_CLIENT_VERSION_ESCAPED}" \
+            -o "$CIPD"
+          printf '%s  %s\n' "$CIPD_CLIENT_SHA" "$CIPD" | sha256sum -c -
+          chmod 0755 "$CIPD"
+
+          {
+            echo "cipd_bootstrap_version=$CIPD_CLIENT_VERSION"
+            echo "cipd_bootstrap_sha256=$CIPD_CLIENT_SHA"
+            "$CIPD" version
+          } | tee -a "$LOG"
+
+          # For this diagnostic run use the package's public latest ref.
+          # The resolved CIPD instance metadata is logged below so a successful
+          # RBE run can be pinned exactly afterward.
+          printf '%s %s\n' "$PINNED_RECLIENT_PACKAGE" \
+            "$RECLIENT_CIPD_VERSION" > "$ENSURE"
+          cat "$ENSURE" | tee -a "$LOG"
+          "$CIPD" ensure -root "$NEW" -ensure-file "$ENSURE" -log-level info 2>&1 | tee -a "$LOG"
+
+          if [ -d "$NEW/.versions" ]; then
+            {
+              echo 'resolved_cipd_versions:'
+              find "$NEW/.versions" -maxdepth 1 -type f -print | sort | while read -r vf; do
+                echo "--- ${vf#$NEW/}"
+                cat "$vf"
+              done
+            } | tee -a "$LOG"
+          fi
+
+          for f in rewrapper reproxy bootstrap; do
+            if [ ! -x "$NEW/$f" ]; then
+              echo "::error::Pinned Reclient package is missing required executable: $f"
+              find "$NEW" -maxdepth 2 -type f -printf '%P\n' | sort | tee -a "$LOG"
+              exit 66
+            fi
+          done
+
+          "$NEW/reproxy" --help > /tmp/reclient-new-reproxy-help.txt 2>&1 || true
+          if ! grep -q -- 'remote_headers' /tmp/reclient-new-reproxy-help.txt; then
+            echo "::error::Reclient ${RECLIENT_CIPD_VERSION} does not advertise remote_headers."
+            grep -E -- 'service|auth|header|tls' /tmp/reclient-new-reproxy-help.txt | head -120 | tee -a "$LOG" || true
+            exit 65
+          fi
+
+          BACKUP=/tmp/reclient-checkpoint-backup
+          rm -rf "$BACKUP"
+          mkdir -p "$BACKUP"
+          for f in rewrapper reproxy bootstrap dumpstats scandeps_server version.txt; do
+            [ -e "$RBE_DIR/$f" ] && cp -a "$RBE_DIR/$f" "$BACKUP/"
+          done
+
+          # Overlay the modern Android/CSD Reclient into the exact directory path
+          # already baked into the restored Ninja graph. Do not change RBE_DIR.
+          rsync -a --exclude='.cipd' "$NEW/" "$RBE_DIR/"
+          for f in rewrapper reproxy bootstrap; do
+            test -x "$RBE_DIR/$f"
+          done
+          [ -e "$BACKUP/rewrapper" ] && touch -r "$BACKUP/rewrapper" "$RBE_DIR/rewrapper"
+
+          "$RBE_DIR/reproxy" --help > /tmp/rbe-test/job-b-upgraded-reproxy-help.txt 2>&1 || true
+          grep -E -- 'remote_headers|service_no_auth|service_no_security|tls_server_name' \
+            /tmp/rbe-test/job-b-upgraded-reproxy-help.txt \
+            | tee /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt
+          grep -q -- 'remote_headers' /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt
+
+          {
+            echo 'installed_files:'
+            find "$NEW" -maxdepth 2 -type f -printf '  %P\n' | sort
+            echo "active_version_file=$(tr '\n' ' ' < "$RBE_DIR/version.txt" 2>/dev/null || true)"
+            echo 'upgrade_result=PASS'
+          } | tee -a "$LOG"
+
       - name: Configure hybrid ZRAM and disk swap for resume
         working-directory: /home/runner/work/los
         shell: bash
@@ -440,12 +569,14 @@ jobs:
             echo 'JOB_B_RBE_MODE=direct-remote'
           } >> "$GITHUB_ENV"
 
-          # Record supported flags without exposing the secret.
+          # The previous step upgraded the path baked into Ninja to a pinned
+          # Android/CSD Reclient and verified remote_headers support. Verify once
+          # more before sending any authenticated RPC to BuildBuddy.
           "$RBE_DIR/reproxy" --help 2>&1 \
-            | grep -E -- '--(service|service_no_security|service_no_auth|remote_headers|tls_server_name)' \
+            | grep -E -- 'remote_headers|service_no_security|service_no_auth|tls_server_name' \
             > /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt || true
-          if ! grep -q -- '--remote_headers' /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt; then
-            echo '::error::Restored reproxy does not advertise --remote_headers.'
+          if ! grep -q -- 'remote_headers' /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt; then
+            echo '::error::Upgraded reproxy unexpectedly does not advertise remote_headers.'
             cat /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt || true
             exit 65
           fi
@@ -519,8 +650,8 @@ jobs:
             exit 74
           fi
 
-          printf 'mode=direct-remote\nbootstrap_rc=0\nremote_rc=0\nservice=remote.buildbuddy.io:443\n' \
-            > "$STATUS_LOG"
+          printf 'mode=direct-remote\nbootstrap_rc=0\nremote_rc=0\nservice=remote.buildbuddy.io:443\nreclient=%s\n' \
+            "$RECLIENT_CIPD_VERSION" > "$STATUS_LOG"
           echo 'Direct BuildBuddy RBE smoke PASS: TLS + API key + CAS + Execute + output download verified.'
           cat "$STATUS_LOG"
 
@@ -731,7 +862,7 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
-          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
+          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
@@ -749,7 +880,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Stop resume RBE bridge and unmount workspace
+      - name: Stop direct RBE and unmount workspace
         if: always()
         shell: bash
         run: |
