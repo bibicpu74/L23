@@ -479,20 +479,41 @@ jobs:
           cat > "$WRAPPER" <<'PYSHIM'
           #!/usr/bin/env python3
           import os
+          import shutil
           import sys
 
           args = sys.argv[1:]
-          try:
+
+          def is_executable(token):
+              # Soong normally passes a workspace-relative tool path such as
+              # prebuilts/clang/.../clang++, but also support PATH commands.
+              if "/" in token:
+                  return os.path.isfile(token) and os.access(token, os.X_OK)
+              return shutil.which(token) is not None
+
+          cmd = None
+
+          # Conventional form: rewrapper [flags] -- command args...
+          if "--" in args:
               sep = args.index("--")
-          except ValueError:
-              sys.stderr.write("direct-local rewrapper shim: missing '--' command separator\\n")
-              sys.exit(64)
+              if sep + 1 < len(args):
+                  cmd = args[sep + 1:]
+          else:
+              # Android Soong commonly emits NO separator:
+              #   rewrapper --flag=value ... executable arg...
+              # Find the first token that resolves to a real executable.
+              for i, token in enumerate(args):
+                  if is_executable(token):
+                      cmd = args[i:]
+                      break
 
-          cmd = args[sep + 1:]
           if not cmd:
-              sys.stderr.write("direct-local rewrapper shim: empty wrapped command\\n")
+              sys.stderr.write("direct-local rewrapper shim: cannot locate wrapped executable\\n")
+              sys.stderr.write("argv=" + repr(args) + "\\n")
               sys.exit(64)
 
+          # True local fallback: never invoke rewrapper/reproxy/RBE. Preserve
+          # Ninja's cwd/environment and exec the wrapped command directly.
           os.execvp(cmd[0], cmd)
           PYSHIM
 
@@ -503,6 +524,8 @@ jobs:
           chmod 0755 /tmp/enable-job-b-direct-local-rewrapper.sh
 
           run_direct_local_probe() {
+            # Intentionally use Soong's no-`--` rewrapper syntax so this probe
+            # validates the exact parser path used by real Ninja actions.
             local out=out/job-b-direct-local-smoke.txt
             local log=/tmp/rbe-test/job-b-direct-local-smoke.log
             rm -f "$out"
@@ -517,7 +540,7 @@ jobs:
               --remote_accept_cache=false \
               --exec_timeout=20s \
               --output_files="${REL_WORKDIR}/${out}" \
-              -- /bin/sh -c 'mkdir -p out && printf "job-b-direct-local-ok\\n" > out/job-b-direct-local-smoke.txt' \
+              /bin/sh -c 'mkdir -p out && printf "job-b-direct-local-ok\\n" > out/job-b-direct-local-smoke.txt' \
               > "$log" 2>&1
             local rc=$?
             set -e
