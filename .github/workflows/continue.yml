@@ -436,11 +436,10 @@ jobs:
         timeout-minutes: 340
         shell: bash
         run: |
-          set -euo pipefail
-          # Android envsetup is not nounset-safe; temporarily disable -u while sourcing.
-          set +u
+          # Android/Lineage envsetup, breakfast/lunch and m shell functions are not nounset-safe.
+          # Keep errexit + pipefail, but do NOT enable `set -u` anywhere in this resume step.
+          set -eo pipefail
           source build/envsetup.sh
-          set -u
           TARGET_REL="${LINEAGE_RELEASE_CONFIG:-}"
           if [ -z "$TARGET_REL" ]; then
             if [ -s vendor/lineage/vars/aosp_target_release.mk ]; then
