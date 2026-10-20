@@ -1,4 +1,4 @@
-name: LineageOS starlte - Resume test
+name: LineageOS starlte - Resume existing R2 checkpoint
 
 on:
   workflow_dispatch:
@@ -106,8 +106,6 @@ jobs:
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
       RCLONE_CONFIG_R2_REGION: "auto"
       PINNED_RCLONE_VERSION: "1.75.2"
-      PINNED_RECLIENT_VERSION: "0.186.0.305f6525"
-      PINNED_RECLIENT_PACKAGE: "infra/rbe/client/linux-amd64-csd"
 
       USE_RBE: "true"
       USE_REWRAPPER: "true"
@@ -118,10 +116,9 @@ jobs:
       RBE_R8_EXEC_STRATEGY: "remote_local_fallback"
       RBE_D8_EXEC_STRATEGY: "remote_local_fallback"
       RBE_JAVAC_EXEC_STRATEGY: "local"
-      RBE_service: "remote.buildbuddy.io:443"
-      RBE_service_no_security: "false"
+      RBE_service: "unix:///tmp/buildbuddy-rbe-bridge/grpc.sock"
+      RBE_service_no_security: "true"
       RBE_service_no_auth: "true"
-      RBE_tls_server_name: "remote.buildbuddy.io"
       RBE_use_application_default_credentials: "false"
       RBE_use_gce_credentials: "false"
       RBE_use_rpc_credentials: "false"
@@ -138,7 +135,7 @@ jobs:
       SOONG_DISK_SWAP_GIB: "12"
       SOONG_SWAP_DISK_RESERVE_GIB: "10"
       RESUME_SOFT_DEADLINE_MINUTES: "325"
-      RBE_BUILD_MAX_ATTEMPTS: "2"
+      RBE_BUILD_MAX_ATTEMPTS: "4"
 
     steps:
       - name: Reclaim root disk for resume runner
@@ -348,88 +345,6 @@ jobs:
           echo "RBE_WRAPPER=$RBE_DIR_FOUND/rewrapper" >> "$GITHUB_ENV"
           cat "$RBE_DIR_FOUND/version.txt" | tee /tmp/rbe-test/job-b-reclient-version.txt
 
-      - name: Upgrade restored Reclient in-place for direct BuildBuddy auth
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -n "${RBE_DIR:-}"
-          test -d "$RBE_DIR"
-          test -x "$RBE_DIR/rewrapper"
-          test -x "$RBE_DIR/reproxy"
-          test -x "$RBE_DIR/bootstrap"
-
-          LOG=/tmp/rbe-test/job-b-reclient-upgrade.txt
-          mkdir -p /tmp/rbe-test
-          : > "$LOG"
-
-          {
-            echo "checkpoint_reclient_dir=$RBE_DIR"
-            echo "checkpoint_version_file=$(tr '\n' ' ' < "$RBE_DIR/version.txt" 2>/dev/null || true)"
-            echo "target_package=$PINNED_RECLIENT_PACKAGE"
-            echo "target_version=$PINNED_RECLIENT_VERSION"
-          } | tee -a "$LOG"
-
-          CIPD=/tmp/cipd-linux-amd64
-          NEW=/tmp/reclient-${PINNED_RECLIENT_VERSION}-csd
-          ENSURE=/tmp/reclient.ensure
-          rm -rf "$NEW"
-          mkdir -p "$NEW"
-
-          curl --fail --location --show-error --silent --retry 5 --retry-delay 2 \
-            'https://chrome-infra-packages.appspot.com/client?platform=linux-amd64' \
-            -o "$CIPD"
-          chmod 0755 "$CIPD"
-          "$CIPD" version | tee -a "$LOG"
-
-          printf '%s %s\n' "$PINNED_RECLIENT_PACKAGE" \
-            "re_client_version:${PINNED_RECLIENT_VERSION}" > "$ENSURE"
-          "$CIPD" ensure -root "$NEW" -ensure-file "$ENSURE" -log-level info 2>&1 | tee -a "$LOG"
-
-          for f in rewrapper reproxy bootstrap; do
-            if [ ! -x "$NEW/$f" ]; then
-              echo "::error::Pinned Reclient package is missing required executable: $f"
-              find "$NEW" -maxdepth 2 -type f -printf '%P\n' | sort | tee -a "$LOG"
-              exit 66
-            fi
-          done
-
-          "$NEW/reproxy" --help > /tmp/reclient-new-reproxy-help.txt 2>&1 || true
-          if ! grep -q -- 'remote_headers' /tmp/reclient-new-reproxy-help.txt; then
-            echo "::error::Pinned Reclient ${PINNED_RECLIENT_VERSION} does not advertise remote_headers."
-            grep -E -- 'service|auth|header|tls' /tmp/reclient-new-reproxy-help.txt | head -120 | tee -a "$LOG" || true
-            exit 65
-          fi
-
-          BACKUP=/tmp/reclient-checkpoint-backup
-          rm -rf "$BACKUP"
-          mkdir -p "$BACKUP"
-          for f in rewrapper reproxy bootstrap dumpstats scandeps_server version.txt; do
-            [ -e "$RBE_DIR/$f" ] && cp -a "$RBE_DIR/$f" "$BACKUP/"
-          done
-
-          # Overlay the modern Android/CSD Reclient into the exact directory path
-          # already baked into the restored Ninja graph. Do not change RBE_DIR.
-          rsync -a --exclude='.cipd' "$NEW/" "$RBE_DIR/"
-          for f in rewrapper reproxy bootstrap; do
-            test -x "$RBE_DIR/$f"
-          done
-          [ -e "$BACKUP/rewrapper" ] && touch -r "$BACKUP/rewrapper" "$RBE_DIR/rewrapper"
-
-          "$RBE_DIR/reproxy" --help > /tmp/rbe-test/job-b-upgraded-reproxy-help.txt 2>&1 || true
-          grep -E -- 'remote_headers|service_no_auth|service_no_security|tls_server_name' \
-            /tmp/rbe-test/job-b-upgraded-reproxy-help.txt \
-            | tee /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt
-          grep -q -- 'remote_headers' /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt
-
-          {
-            echo 'installed_files:'
-            find "$NEW" -maxdepth 2 -type f -printf '  %P\n' | sort
-            echo "active_version_file=$(tr '\n' ' ' < "$RBE_DIR/version.txt" 2>/dev/null || true)"
-            echo 'upgrade_result=PASS'
-          } | tee -a "$LOG"
-
       - name: Configure hybrid ZRAM and disk swap for resume
         working-directory: /home/runner/work/los
         shell: bash
@@ -479,17 +394,64 @@ jobs:
             sysctl net.ipv4.tcp_keepalive_probes 2>/dev/null || true
           } | tee /tmp/rbe-test/tcp-keepalive-job-b.txt
 
-      - name: Configure and probe direct BuildBuddy RBE
+      - name: Start authenticated BuildBuddy gRPC bridge for resume
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
+          BRIDGE_DIR=/tmp/buildbuddy-rbe-bridge
+          install -d -m 700 "$BRIDGE_DIR" /tmp/rbe-test
+          umask 077
+          python3 - <<'PYBRIDGE2'
+          import os
+          from pathlib import Path
+          secret=os.environ['BUILDBUDDY_API_KEY']
+          if not secret or any(ch in secret for ch in ('\n','\r','\x00')):
+              raise SystemExit('Invalid BuildBuddy API key format')
+          encoded=secret.replace('\\','\\\\').replace('"','\\"')
+          cfg='''worker_processes auto;
+          pid /tmp/buildbuddy-rbe-bridge/nginx.pid;
+          error_log /tmp/rbe-test/buildbuddy-grpc-errors-job-b.log warn;
+          events { worker_connections 2048; }
+          http {
+            log_format rbe_fmt '$time_iso8601 $status $request_length bytes -> grpc_status=$upstream_trailer_grpc_status';
+            access_log /tmp/rbe-test/nginx-access-job-b.log rbe_fmt;
+            client_max_body_size 0;
+            server {
+              listen unix:/tmp/buildbuddy-rbe-bridge/grpc.sock http2;
+              server_name localhost;
+              location / {
+                grpc_pass grpcs://remote.buildbuddy.io:443;
+                grpc_ssl_server_name on;
+                grpc_ssl_name remote.buildbuddy.io;
+                grpc_ssl_verify on;
+                grpc_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                grpc_connect_timeout 30s;
+                grpc_read_timeout 300s;
+                grpc_send_timeout 300s;
+                grpc_socket_keepalive on;
+                # Retry transient gateway failures before they reach rewrapper.
+                grpc_next_upstream error timeout http_502 http_503 http_504;
+                grpc_next_upstream_tries 4;
+                grpc_next_upstream_timeout 60s;
+                grpc_set_header x-buildbuddy-api-key "__KEY__";
+              }
+            }
+          }
+          '''.replace('__KEY__',encoded)
+          Path('/tmp/buildbuddy-rbe-bridge/nginx.conf').write_text(cfg)
+          PYBRIDGE2
+          nginx -t -c "$BRIDGE_DIR/nginx.conf"
+          nginx -c "$BRIDGE_DIR/nginx.conf"
+          for _ in $(seq 1 20); do [ -S "$BRIDGE_DIR/grpc.sock" ] && exit 0; sleep 1; done
+          echo '::error::Resume BuildBuddy bridge failed to start.'
+          exit 1
 
-          test -n "${BUILDBUDDY_API_KEY:-}"
-          if [[ "$BUILDBUDDY_API_KEY" == *$'\n'* || "$BUILDBUDDY_API_KEY" == *$'\r'* ]]; then
-            echo '::error::BUILDBUDDY_API_KEY contains an invalid newline.'
-            exit 64
-          fi
+      - name: Probe Job B RBE and select remote or direct-local execution
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
 
           EXEC_ROOT="$(dirname "$(pwd -P)")"
           REL_WORKDIR="$(realpath --relative-to="$EXEC_ROOT" "$PWD")"
@@ -498,55 +460,98 @@ jobs:
           test -x "$RBE_DIR/reproxy"
           test -x "$RBE_DIR/bootstrap"
 
-          # BuildBuddy Cloud accepts the API key as gRPC metadata. Reclient's
-          # remote_headers are sent on each RPC, so no nginx/header-injection
-          # bridge is needed. TLS remains end-to-end to BuildBuddy.
-          export RBE_service='remote.buildbuddy.io:443'
-          export RBE_service_no_security='false'
-          export RBE_service_no_auth='true'
-          export RBE_tls_server_name='remote.buildbuddy.io'
-          export RBE_remote_headers="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
-          export RBE_use_application_default_credentials='false'
-          export RBE_use_gce_credentials='false'
-          export RBE_use_rpc_credentials='false'
+          # rewrapper --exec_strategy=local is still LERC and talks to reproxy.
+          # This fallback must bypass rewrapper/reproxy entirely.
+          cat > /tmp/enable-job-b-direct-local-rewrapper.sh <<'LOCALHELPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          WRAPPER="${RBE_WRAPPER:?RBE_WRAPPER is required}"
+          REAL="${WRAPPER}.remote-real"
 
-          # Persist the non-secret direct-RBE settings plus the masked secret
-          # header for subsequent GitHub Actions steps.
-          {
-            echo 'RBE_service=remote.buildbuddy.io:443'
-            echo 'RBE_service_no_security=false'
-            echo 'RBE_service_no_auth=true'
-            echo 'RBE_tls_server_name=remote.buildbuddy.io'
-            echo 'RBE_use_application_default_credentials=false'
-            echo 'RBE_use_gce_credentials=false'
-            echo 'RBE_use_rpc_credentials=false'
-            printf 'RBE_remote_headers=x-buildbuddy-api-key=%s\n' "$BUILDBUDDY_API_KEY"
-            echo 'JOB_B_RBE_MODE=direct-remote'
-          } >> "$GITHUB_ENV"
-
-          # The previous step upgraded the path baked into Ninja to a pinned
-          # Android/CSD Reclient and verified remote_headers support. Verify once
-          # more before sending any authenticated RPC to BuildBuddy.
-          "$RBE_DIR/reproxy" --help 2>&1 \
-            | grep -E -- 'remote_headers|service_no_security|service_no_auth|tls_server_name' \
-            > /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt || true
-          if ! grep -q -- 'remote_headers' /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt; then
-            echo '::error::Upgraded reproxy unexpectedly does not advertise remote_headers.'
-            cat /tmp/rbe-test/job-b-direct-rbe-supported-flags.txt || true
-            exit 65
+          if [ -x "$REAL" ]; then
+            echo "Job-B direct-local rewrapper shim already enabled: $WRAPPER"
+            exit 0
           fi
 
-          # Dedicated reproxy for a remote-only smoke. This validates, in one
-          # action, TLS + API-key metadata + CAS upload + Execute + output download.
-          SMOKE_SOCKET="/tmp/job-b-direct-rbe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.sock"
-          SMOKE_PROXY="unix://${SMOKE_SOCKET}"
-          SMOKE_INPUT="${REL_WORKDIR}/build/soong/remoteexec/remoteexec.go"
-          REMOTE_OUT=out/job-b-direct-rbe-smoke.txt
-          BOOT_LOG=/tmp/rbe-test/job-b-direct-rbe-bootstrap.log
-          REMOTE_LOG=/tmp/rbe-test/job-b-direct-rbe-smoke.log
-          STATUS_LOG=/tmp/rbe-test/job-b-rbe-mode.txt
-          rm -f "$SMOKE_SOCKET" "$REMOTE_OUT"
-          test -s "$EXEC_ROOT/$SMOKE_INPUT"
+          test -x "$WRAPPER"
+          mv "$WRAPPER" "$REAL"
+
+          cat > "$WRAPPER" <<'PYSHIM'
+          #!/usr/bin/env python3
+          import os
+          import shutil
+          import sys
+
+          args = sys.argv[1:]
+
+          def is_executable(token):
+              # Soong normally passes a workspace-relative tool path such as
+              # prebuilts/clang/.../clang++, but also support PATH commands.
+              if "/" in token:
+                  return os.path.isfile(token) and os.access(token, os.X_OK)
+              return shutil.which(token) is not None
+
+          cmd = None
+
+          # Conventional form: rewrapper [flags] -- command args...
+          if "--" in args:
+              sep = args.index("--")
+              if sep + 1 < len(args):
+                  cmd = args[sep + 1:]
+          else:
+              # Android Soong commonly emits NO separator:
+              #   rewrapper --flag=value ... executable arg...
+              # Find the first token that resolves to a real executable.
+              for i, token in enumerate(args):
+                  if is_executable(token):
+                      cmd = args[i:]
+                      break
+
+          if not cmd:
+              sys.stderr.write("direct-local rewrapper shim: cannot locate wrapped executable\\n")
+              sys.stderr.write("argv=" + repr(args) + "\\n")
+              sys.exit(64)
+
+          # True local fallback: never invoke rewrapper/reproxy/RBE. Preserve
+          # Ninja's cwd/environment and exec the wrapped command directly.
+          os.execvp(cmd[0], cmd)
+          PYSHIM
+
+          chmod 0755 "$WRAPPER"
+          touch -r "$REAL" "$WRAPPER"
+          echo "Enabled Job-B DIRECT local rewrapper shim: $WRAPPER (saved remote binary: $REAL)"
+          LOCALHELPER
+          chmod 0755 /tmp/enable-job-b-direct-local-rewrapper.sh
+
+          run_direct_local_probe() {
+            # Intentionally use Soong's no-`--` rewrapper syntax so this probe
+            # validates the exact parser path used by real Ninja actions.
+            local out=out/job-b-direct-local-smoke.txt
+            local log=/tmp/rbe-test/job-b-direct-local-smoke.log
+            rm -f "$out"
+
+            set +e
+            timeout 30s "$RBE_WRAPPER" \
+              --server_address=unix:///tmp/this-socket-must-not-be-used.sock \
+              --labels=type=tool,name=job-b-direct-local-probe \
+              --exec_root="$EXEC_ROOT" \
+              --inputs="${REL_WORKDIR}/build/soong/remoteexec/remoteexec.go" \
+              --exec_strategy=remote \
+              --remote_accept_cache=false \
+              --exec_timeout=20s \
+              --output_files="${REL_WORKDIR}/${out}" \
+              /bin/sh -c 'mkdir -p out && printf "job-b-direct-local-ok\\n" > out/job-b-direct-local-smoke.txt' \
+              > "$log" 2>&1
+            local rc=$?
+            set -e
+
+            if [ "$rc" -ne 0 ] || [ ! -s "$out" ] || \
+               ! grep -Fxq 'job-b-direct-local-ok' "$out"; then
+              cat "$log" || true
+              return 1
+            fi
+            return 0
+          }
 
           IMAGE="$(python3 - <<'P0IMAGE'
           import pathlib, re
@@ -558,56 +563,93 @@ jobs:
           P0IMAGE
           )"
 
+          SMOKE_SOCKET="/tmp/job-b-rbe-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.sock"
+          SMOKE_PROXY="unix://${SMOKE_SOCKET}"
+          SMOKE_INPUT="${REL_WORKDIR}/build/soong/remoteexec/remoteexec.go"
+          REMOTE_OUT=out/job-b-rbe-remote-smoke.txt
+          REMOTE_LOG=/tmp/rbe-test/job-b-rbe-remote-smoke.log
+          BOOT_LOG=/tmp/rbe-test/job-b-rbe-smoke-bootstrap.log
+          STATUS_LOG=/tmp/rbe-test/job-b-rbe-mode.txt
+
+          rm -f "$SMOKE_SOCKET" "$REMOTE_OUT"
+          test -s "$EXEC_ROOT/$SMOKE_INPUT"
+
+          REMOTE_OK=0
+          BOOT_RC=1
+          REMOTE_RC=125
+          REQS_BEFORE=0
+          REQS_AFTER=0
+
           set +e
-          RBE_server_address="$SMOKE_PROXY" timeout 60s "$RBE_DIR/bootstrap" \
+          RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
             -server_address="$SMOKE_PROXY" \
             -re_proxy="$PWD/$RBE_DIR/reproxy" \
             -output_dir=/tmp/rbe-test \
-            -reproxy_wait_seconds=45 \
+            -reproxy_wait_seconds=30 \
             > "$BOOT_LOG" 2>&1
           BOOT_RC=$?
           set -e
 
-          if [ "$BOOT_RC" -ne 0 ] || [ ! -S "$SMOKE_SOCKET" ]; then
-            echo '::error::Direct BuildBuddy reproxy failed to start.'
+          if [ "$BOOT_RC" -eq 0 ] && [ -S "$SMOKE_SOCKET" ]; then
+            REQS_BEFORE="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
+            set +e
+            timeout 150s "$RBE_WRAPPER" \
+              --server_address="$SMOKE_PROXY" \
+              --labels=type=tool,name=job-b-rbe-probe \
+              --exec_root="$EXEC_ROOT" \
+              --inputs="$SMOKE_INPUT" \
+              --platform="container-image=$IMAGE" \
+              --exec_strategy=remote \
+              --remote_accept_cache=false \
+              --exec_timeout=90s \
+              --output_files="${REL_WORKDIR}/${REMOTE_OUT}" \
+              -- /bin/sh -c 'mkdir -p out && printf "job-b-rbe-remote-ok\\n" > out/job-b-rbe-remote-smoke.txt' \
+              > "$REMOTE_LOG" 2>&1
+            REMOTE_RC=$?
+            set -e
+            REQS_AFTER="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
+
+            if [ "$REMOTE_RC" -eq 0 ] && \
+               [ "$REQS_AFTER" -gt "$REQS_BEFORE" ] && \
+               [ -s "$REMOTE_OUT" ] && \
+               grep -Fxq 'job-b-rbe-remote-ok' "$REMOTE_OUT"; then
+              REMOTE_OK=1
+            fi
+          else
+            echo "::warning::Dedicated remote RBE probe reproxy did not start; falling back to direct-local execution."
             cat "$BOOT_LOG" || true
-            exit 70
           fi
 
-          set +e
-          timeout 180s "$RBE_WRAPPER" \
-            --server_address="$SMOKE_PROXY" \
-            --labels=type=tool,name=job-b-direct-buildbuddy-probe \
-            --exec_root="$EXEC_ROOT" \
-            --inputs="$SMOKE_INPUT" \
-            --platform="container-image=$IMAGE" \
-            --exec_strategy=remote \
-            --remote_accept_cache=false \
-            --exec_timeout=120s \
-            --output_files="${REL_WORKDIR}/${REMOTE_OUT}" \
-            -- /bin/sh -c 'mkdir -p out && printf "job-b-direct-buildbuddy-rbe-ok\n" > out/job-b-direct-rbe-smoke.txt' \
-            > "$REMOTE_LOG" 2>&1
-          REMOTE_RC=$?
-          set -e
-
-          RBE_server_address="$SMOKE_PROXY" timeout 45s "$RBE_DIR/bootstrap" \
-            -server_address="$SMOKE_PROXY" \
-            -shutdown -output_dir=/tmp/rbe-test \
-            > /tmp/rbe-test/job-b-direct-rbe-shutdown.log 2>&1 || true
+          if [ "$BOOT_RC" -eq 0 ] && [ -S "$SMOKE_SOCKET" ]; then
+            RBE_server_address="$SMOKE_PROXY" timeout 40s "$RBE_DIR/bootstrap" \
+              -server_address="$SMOKE_PROXY" \
+              -shutdown -output_dir=/tmp/rbe-test \
+              >/tmp/rbe-test/job-b-rbe-smoke-shutdown.log 2>&1 || true
+          fi
           rm -f "$SMOKE_SOCKET"
 
-          if [ "$REMOTE_RC" -ne 0 ] || [ ! -s "$REMOTE_OUT" ] || \
-             ! grep -Fxq 'job-b-direct-buildbuddy-rbe-ok' "$REMOTE_OUT"; then
-            echo '::error::Direct BuildBuddy remote-only RBE smoke FAILED. No local fallback will be used in this diagnostic workflow.'
-            cat "$REMOTE_LOG" || true
-            printf 'mode=direct-remote-failed\nbootstrap_rc=%s\nremote_rc=%s\n' \
-              "$BOOT_RC" "$REMOTE_RC" > "$STATUS_LOG"
-            exit 74
+          if [ "$REMOTE_OK" -eq 1 ]; then
+            echo "JOB_B_RBE_MODE=remote" >> "$GITHUB_ENV"
+            printf 'mode=remote\nbootstrap_rc=%s\nremote_rc=%s\nrequests_before=%s\nrequests_after=%s\n' \
+              "$BOOT_RC" "$REMOTE_RC" "$REQS_BEFORE" "$REQS_AFTER" > "$STATUS_LOG"
+            echo 'Job-B remote-only RBE smoke PASS; keeping remote execution enabled.'
+          else
+            echo '::warning::Job-B remote RBE unavailable; switching to true direct-local wrapper.'
+            [ -s "$REMOTE_LOG" ] && cat "$REMOTE_LOG" || true
+
+            /tmp/enable-job-b-direct-local-rewrapper.sh
+
+            if ! run_direct_local_probe; then
+              echo '::error::Direct-local rewrapper shim probe failed.'
+              exit 74
+            fi
+
+            echo "JOB_B_RBE_MODE=direct-local" >> "$GITHUB_ENV"
+            printf 'mode=direct-local\nbootstrap_rc=%s\nremote_rc=%s\nrequests_before=%s\nrequests_after=%s\nreason=remote_probe_failed\n' \
+              "$BOOT_RC" "$REMOTE_RC" "$REQS_BEFORE" "$REQS_AFTER" > "$STATUS_LOG"
+            echo 'Job-B DIRECT local fallback PASS; remaining wrapped actions will bypass reproxy/RBE.'
           fi
 
-          printf 'mode=direct-remote\nbootstrap_rc=0\nremote_rc=0\nservice=remote.buildbuddy.io:443\nreclient=%s\n' \
-            "$PINNED_RECLIENT_VERSION" > "$STATUS_LOG"
-          echo 'Direct BuildBuddy RBE smoke PASS: TLS + API key + CAS + Execute + output download verified.'
           cat "$STATUS_LOG"
 
       - name: Resume LineageOS bacon from restored Ninja state
@@ -620,7 +662,7 @@ jobs:
           # Keep errexit + pipefail, but do NOT enable `set -u` anywhere in this resume step.
           set -eo pipefail
           source build/envsetup.sh
-          echo "Job-B execution mode: ${JOB_B_RBE_MODE:-direct-remote}"
+          echo "Job-B execution mode: ${JOB_B_RBE_MODE:-remote}"
           TARGET_REL="${LINEAGE_RELEASE_CONFIG:-}"
           if [ -z "$TARGET_REL" ]; then
             if [ -s vendor/lineage/vars/aosp_target_release.mk ]; then
@@ -674,7 +716,7 @@ jobs:
             kill -TERM "$p" 2>/dev/null || true
           }
 
-          MAX_ATTEMPTS="${RBE_BUILD_MAX_ATTEMPTS:-2}"
+          MAX_ATTEMPTS="${RBE_BUILD_MAX_ATTEMPTS:-4}"
           ATTEMPT=1
           BUILD_OK=0
 
@@ -708,8 +750,8 @@ jobs:
             while kill -0 "$PID" 2>/dev/null; do
               now="$(date +%s)"
               progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$ATTEMPT_LOG" | tail -1 || true)"
-              reproxy_count="$(pgrep -xc reproxy 2>/dev/null || echo 0)"
-              echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_mode=${JOB_B_RBE_MODE:-direct-remote} reproxy_processes=$reproxy_count free_gib=$(( $(df -B1 --output=avail . | tail -1 | tr -d ' ') / 1073741824 ))"
+              reqs="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
+              echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_grpc_requests=$reqs free_gib=$(( $(df -B1 --output=avail . | tail -1 | tr -d ' ') / 1073741824 ))"
               if (( now >= DEADLINE )); then
                 echo '::error::Job B resume soft deadline reached before ROM completion.'
                 DEADLINE_HIT=1
@@ -753,18 +795,20 @@ jobs:
               echo "::warning::Transient RBE/gateway failure on attempt ${ATTEMPT}; preserving Ninja outputs and retrying. Last progress: ${progress:-unknown}"
               echo "attempt=${ATTEMPT} transient_rbe=1 last_progress=${progress:-unknown}" >> "$ATTEMPTS_LOG"
 
-              echo "::warning::Direct BuildBuddy RBE transport failed during build attempt ${ATTEMPT}; preserving Ninja outputs and retrying direct remote once."
-              printf 'runtime_retry_attempt=%s\nruntime_retry_reason=transient_direct_rbe_failure\n' \
-                "$ATTEMPT" >> /tmp/rbe-test/job-b-rbe-mode.txt
-
-              # Stop any stale reproxy. The next m invocation will bootstrap a
-              # fresh direct-TLS reproxy using RBE_service + RBE_remote_headers.
-              if pgrep -x reproxy >/dev/null; then
-                timeout 45s "$RBE_DIR/bootstrap" -shutdown -output_dir=/tmp/rbe-test \
-                  > /tmp/rbe-test/job-b-direct-rbe-runtime-shutdown-${ATTEMPT}.log 2>&1 || true
-                pkill -x reproxy 2>/dev/null || true
+              # Reload nginx to refresh upstream DNS/TLS state without destroying the restored workspace.
+              if [ "${JOB_B_RBE_MODE:-remote}" = "remote" ]; then
+                echo "::warning::Remote RBE degraded after the preflight; switching all baked rewrapper actions to TRUE direct-local execution for the next incremental attempt."
+                /tmp/enable-job-b-direct-local-rewrapper.sh
+                export JOB_B_RBE_MODE=direct-local
+                echo "JOB_B_RBE_MODE=direct-local" >> "$GITHUB_ENV"
+                printf 'runtime_fallback_attempt=%s\nruntime_fallback_reason=transient_rbe_failure\n' \
+                  "$ATTEMPT" >> /tmp/rbe-test/job-b-rbe-mode.txt
+              else
+                echo '::error::A remote transport error was still observed while direct-local mode was active; refusing an endless retry loop.'
+                exit "$RC"
               fi
-              sleep 15
+
+              sleep 10
               ATTEMPT=$((ATTEMPT + 1))
               continue
             fi
@@ -817,7 +861,7 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
-          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
+          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt nginx-access-job-b.log buildbuddy-grpc-errors-job-b.log tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-rbe-remote-smoke.log job-b-direct-local-smoke.log job-b-rbe-smoke-bootstrap.log job-b-rbe-smoke-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
@@ -835,7 +879,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Stop direct RBE and unmount workspace
+      - name: Stop resume RBE bridge and unmount workspace
         if: always()
         shell: bash
         run: |
@@ -844,6 +888,8 @@ jobs:
           if pgrep -x reproxy >/dev/null && [ -n "${RBE_DIR:-}" ] && [ -x "${RBE_DIR}/bootstrap" ]; then
             timeout 60s "${RBE_DIR}/bootstrap" -shutdown -output_dir=/tmp/rbe-test >/tmp/reproxy-job-b-finalize.log 2>&1 || true
           fi
+          CFG=/tmp/buildbuddy-rbe-bridge/nginx.conf
+          [ -f "$CFG" ] && nginx -s quit -c "$CFG" >/dev/null 2>&1 || true
           sync
           mountpoint -q /home/runner/work/los && sudo umount /home/runner/work/los || true
           mountpoint -q "${BTRFS_TOP_MOUNT}" && sudo umount "${BTRFS_TOP_MOUNT}" || true
