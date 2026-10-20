@@ -105,7 +105,7 @@ jobs:
       RCLONE_CONFIG_R2_ENDPOINT: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
       RCLONE_CONFIG_R2_REGION: "auto"
-      RCLONE_VERSION: "1.75.2"
+      PINNED_RCLONE_VERSION: "1.75.2"
 
       # Android / Soong RBE
       # Keep both explicit: Soong dex remote rules require UseREWrapper() in
@@ -289,15 +289,15 @@ jobs:
 
           # Do not use Ubuntu's old rclone (1.60.1-DEV on ubuntu-24.04 images).
           # Pin the upstream stable release and verify it against upstream SHA256SUMS.
-          RCLONE_ZIP="/tmp/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
-          RCLONE_SUMS="/tmp/rclone-v${RCLONE_VERSION}-SHA256SUMS"
+          RCLONE_ZIP="/tmp/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip"
+          RCLONE_SUMS="/tmp/rclone-v${PINNED_RCLONE_VERSION}-SHA256SUMS"
           curl -fsSL --retry 5 --retry-delay 2 \
-            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip" \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip" \
             -o "$RCLONE_ZIP"
           curl -fsSL --retry 5 --retry-delay 2 \
-            "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS" \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/SHA256SUMS" \
             -o "$RCLONE_SUMS"
-          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
+          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
           test -n "$EXPECTED_RCLONE_SHA"
           printf '%s  %s\n' "$EXPECTED_RCLONE_SHA" "$RCLONE_ZIP" | sha256sum -c -
           rm -rf /tmp/rclone-pinned
@@ -313,7 +313,7 @@ jobs:
               exit 1
             fi
           done
-          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          test "$(rclone version | head -1)" = "rclone v${PINNED_RCLONE_VERSION}"
           rclone version | head -4
           btrfs version
           zstd --version
@@ -344,7 +344,7 @@ jobs:
               exit 1
             fi
           done
-          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          test "$(rclone version | head -1)" = "rclone v${PINNED_RCLONE_VERSION}"
           rclone version | head -4
           rclone lsf "r2:${R2_BUCKET}" --max-depth 1 >/tmp/r2-list-probe.txt
 
@@ -2582,7 +2582,7 @@ jobs:
 
           HASHER=$'import hashlib,sys\nh=hashlib.sha256()\ni=sys.stdin.buffer\no=sys.stdout.buffer\nf=sys.argv[1]\nwhile True:\n    b=i.read(8*1024*1024)\n    if not b: break\n    h.update(b)\n    o.write(b)\n    o.flush()\nopen(f,"w").write(h.hexdigest()+"\\n")'
 
-          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          test "$(rclone version | head -1)" = "rclone v${PINNED_RCLONE_VERSION}"
           echo "checkpoint_rclone_version=$(rclone version | head -1)" >> /tmp/rbe-test/checkpoint-send-mode.txt
           set -o pipefail
           if [ "$SEND_COMPRESSED" = 1 ]; then
@@ -2748,7 +2748,7 @@ jobs:
       RCLONE_CONFIG_R2_ENDPOINT: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
       RCLONE_CONFIG_R2_REGION: "auto"
-      RCLONE_VERSION: "1.75.2"
+      PINNED_RCLONE_VERSION: "1.75.2"
 
       USE_RBE: "true"
       USE_REWRAPPER: "true"
@@ -2819,15 +2819,15 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             "linux-modules-extra-$(uname -r)" || true
 
-          RCLONE_ZIP="/tmp/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
-          RCLONE_SUMS="/tmp/rclone-v${RCLONE_VERSION}-SHA256SUMS"
+          RCLONE_ZIP="/tmp/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip"
+          RCLONE_SUMS="/tmp/rclone-v${PINNED_RCLONE_VERSION}-SHA256SUMS"
           curl -fsSL --retry 5 --retry-delay 2 \
-            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip" \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip" \
             -o "$RCLONE_ZIP"
           curl -fsSL --retry 5 --retry-delay 2 \
-            "https://downloads.rclone.org/v${RCLONE_VERSION}/SHA256SUMS" \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/SHA256SUMS" \
             -o "$RCLONE_SUMS"
-          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
+          EXPECTED_RCLONE_SHA="$(awk -v f="rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip" '$2==f {print $1}' "$RCLONE_SUMS")"
           test -n "$EXPECTED_RCLONE_SHA"
           printf '%s  %s\n' "$EXPECTED_RCLONE_SHA" "$RCLONE_ZIP" | sha256sum -c -
           rm -rf /tmp/rclone-pinned
@@ -2843,7 +2843,7 @@ jobs:
               exit 1
             fi
           done
-          test "$(rclone version | head -1)" = "rclone v${RCLONE_VERSION}"
+          test "$(rclone version | head -1)" = "rclone v${PINNED_RCLONE_VERSION}"
           rclone version | head -4
           btrfs version
           zstd --version
