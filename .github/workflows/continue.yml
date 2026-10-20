@@ -135,6 +135,7 @@ jobs:
       SOONG_DISK_SWAP_GIB: "12"
       SOONG_SWAP_DISK_RESERVE_GIB: "10"
       RESUME_SOFT_DEADLINE_MINUTES: "325"
+      RBE_BUILD_MAX_ATTEMPTS: "4"
 
     steps:
       - name: Reclaim root disk for resume runner
@@ -375,12 +376,22 @@ jobs:
             exit 1
           fi
 
-      - name: Check BuildBuddy network connectivity on resume runner
+      - name: Check BuildBuddy network connectivity and tune TCP keepalive
         shell: bash
         run: |
           set -e
           getent hosts remote.buildbuddy.io
           timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
+
+          # Keep long-lived gRPC/TLS connections from silently dying behind gateways.
+          sudo sysctl -w net.ipv4.tcp_keepalive_time=180 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_keepalive_intvl=30 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_keepalive_probes=5 2>/dev/null || true
+          {
+            sysctl net.ipv4.tcp_keepalive_time 2>/dev/null || true
+            sysctl net.ipv4.tcp_keepalive_intvl 2>/dev/null || true
+            sysctl net.ipv4.tcp_keepalive_probes 2>/dev/null || true
+          } | tee /tmp/rbe-test/tcp-keepalive-job-b.txt
 
       - name: Start authenticated BuildBuddy gRPC bridge for resume
         working-directory: /home/runner/work/los
@@ -417,6 +428,11 @@ jobs:
                 grpc_connect_timeout 30s;
                 grpc_read_timeout 300s;
                 grpc_send_timeout 300s;
+                grpc_socket_keepalive on;
+                # Retry transient gateway failures before they reach rewrapper.
+                grpc_next_upstream error timeout http_502 http_503 http_504;
+                grpc_next_upstream_tries 4;
+                grpc_next_upstream_timeout 60s;
                 grpc_set_header x-buildbuddy-api-key "__KEY__";
               }
             }
@@ -483,41 +499,119 @@ jobs:
           START="$(cat /tmp/job-b-start-epoch.txt)"
           DEADLINE=$((START + RESUME_SOFT_DEADLINE_MINUTES * 60))
           LOG=/tmp/rbe-test/resume-full-rom-build.log
-          STATUS=/tmp/rbe-test/resume-build-status.txt
+          ATTEMPTS_LOG=/tmp/rbe-test/resume-build-attempts.txt
           : > "$LOG"
-          (
-            set +e
-            set -o pipefail
-            m -j"${LOCAL_NINJA_JOBS}" --skip-soong-tests bacon 2>&1 | tee "$LOG"
-            echo "${PIPESTATUS[0]}" > "$STATUS"
-          ) &
-          PID=$!
+          : > "$ATTEMPTS_LOG"
+
           stop_tree() {
             local p="$1" c
             while IFS= read -r c; do [ -n "$c" ] && stop_tree "$c"; done < <(pgrep -P "$p" 2>/dev/null || true)
             kill -TERM "$p" 2>/dev/null || true
           }
-          while kill -0 "$PID" 2>/dev/null; do
+
+          MAX_ATTEMPTS="${RBE_BUILD_MAX_ATTEMPTS:-4}"
+          ATTEMPT=1
+          BUILD_OK=0
+
+          while (( ATTEMPT <= MAX_ATTEMPTS )); do
             now="$(date +%s)"
-            progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$LOG" | tail -1 || true)"
-            reqs="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
-            echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') resume progress=${progress:-unknown} rbe_grpc_requests=$reqs free_gib=$(( $(df -B1 --output=avail . | tail -1 | tr -d ' ') / 1073741824 ))"
             if (( now >= DEADLINE )); then
-              echo '::error::Job B resume soft deadline reached before ROM completion.'
-              stop_tree "$PID"
+              echo '::error::Job B resume soft deadline reached before starting another build attempt.'
+              exit 124
+            fi
+
+            ATTEMPT_LOG="/tmp/rbe-test/resume-full-rom-build-attempt-${ATTEMPT}.log"
+            STATUS="/tmp/rbe-test/resume-build-status-attempt-${ATTEMPT}.txt"
+            rm -f "$STATUS"
+            : > "$ATTEMPT_LOG"
+
+            printf '\n=== RESUME BUILD ATTEMPT %d/%d @ %s ===\n' \
+              "$ATTEMPT" "$MAX_ATTEMPTS" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              | tee -a "$LOG" "$ATTEMPTS_LOG"
+
+            (
+              set +e
+              set -o pipefail
+              m -j"${LOCAL_NINJA_JOBS}" --skip-soong-tests bacon 2>&1 \
+                | tee "$ATTEMPT_LOG" \
+                | tee -a "$LOG"
+              echo "${PIPESTATUS[0]}" > "$STATUS"
+            ) &
+            PID=$!
+            DEADLINE_HIT=0
+
+            while kill -0 "$PID" 2>/dev/null; do
+              now="$(date +%s)"
+              progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$ATTEMPT_LOG" | tail -1 || true)"
+              reqs="$(wc -l < /tmp/rbe-test/nginx-access-job-b.log 2>/dev/null || echo 0)"
+              echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_grpc_requests=$reqs free_gib=$(( $(df -B1 --output=avail . | tail -1 | tr -d ' ') / 1073741824 ))"
+              if (( now >= DEADLINE )); then
+                echo '::error::Job B resume soft deadline reached before ROM completion.'
+                DEADLINE_HIT=1
+                stop_tree "$PID"
+                break
+              fi
+              sleep 30
+            done
+
+            set +e
+            wait "$PID"
+            WAIT_RC=$?
+            set -e
+            RC="$WAIT_RC"
+            [ -s "$STATUS" ] && RC="$(cat "$STATUS")"
+
+            if (( DEADLINE_HIT == 1 )); then
+              exit 124
+            fi
+
+            if [ "$RC" -eq 0 ]; then
+              echo "attempt=${ATTEMPT} result=success" | tee -a "$ATTEMPTS_LOG"
+              BUILD_OK=1
               break
             fi
-            sleep 30
-          done
-          set +e
-          wait "$PID"
-          WAIT_RC=$?
-          set -e
-          RC="$WAIT_RC"
-          [ -s "$STATUS" ] && RC="$(cat "$STATUS")"
-          if [ "$RC" -ne 0 ]; then
-            tail -n 220 "$LOG" || true
+
+            echo "attempt=${ATTEMPT} result=failed rc=${RC}" | tee -a "$ATTEMPTS_LOG"
+            tail -n 220 "$ATTEMPT_LOG" || true
+
+            # Only retry failures that look like transient RBE/gateway transport errors.
+            # A plain authentication failure without a 5xx/Unavailable signal remains fatal.
+            if grep -Eqi \
+              '502 \(Bad Gateway\)|503 \(Service Unavailable\)|504 \(Gateway Timeout\)|retry budget exhausted|code = Unavailable|unexpected HTTP status code|received unexpected content-type "text/html"|connection reset by peer|transport is closing' \
+              "$ATTEMPT_LOG"; then
+              if (( ATTEMPT >= MAX_ATTEMPTS )); then
+                echo "::error::Transient RBE failure persisted through ${MAX_ATTEMPTS} incremental attempts."
+                exit "$RC"
+              fi
+
+              progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$ATTEMPT_LOG" | tail -1 || true)"
+              echo "::warning::Transient RBE/gateway failure on attempt ${ATTEMPT}; preserving Ninja outputs and retrying. Last progress: ${progress:-unknown}"
+              echo "attempt=${ATTEMPT} transient_rbe=1 last_progress=${progress:-unknown}" >> "$ATTEMPTS_LOG"
+
+              # Reload nginx to refresh upstream DNS/TLS state without destroying the restored workspace.
+              CFG=/tmp/buildbuddy-rbe-bridge/nginx.conf
+              if [ -f "$CFG" ]; then
+                nginx -s reload -c "$CFG" >/tmp/rbe-test/nginx-reload-attempt-${ATTEMPT}.log 2>&1 || {
+                  nginx -s quit -c "$CFG" >/dev/null 2>&1 || true
+                  sleep 2
+                  nginx -c "$CFG"
+                }
+              fi
+
+              # Reproxy normally survives a failed action. If it died, the next m invocation
+              # will bootstrap it again; remove no Ninja outputs and do not rerun Soong.
+              sleep $((15 * ATTEMPT))
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+
+            echo "::error::Build failed with a non-transient error; refusing to hide it behind retries."
             exit "$RC"
+          done
+
+          if [ "$BUILD_OK" -ne 1 ]; then
+            echo '::error::Resume build did not complete successfully.'
+            exit 1
           fi
 
           ROM_DIR=out/target/product/starlte
@@ -559,7 +653,7 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
-          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resumed-rom-sha256.txt nginx-access-job-b.log buildbuddy-grpc-errors-job-b.log; do
+          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt nginx-access-job-b.log buildbuddy-grpc-errors-job-b.log tcp-keepalive-job-b.txt; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
