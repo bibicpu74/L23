@@ -1,4 +1,4 @@
-name: LineageOS starlte - Resume existing R2 checkpoint
+name: LineageOS starlte - Resume any R2 checkpoint
 
 on:
   workflow_dispatch:
@@ -37,27 +37,27 @@ on:
         description: "Existing R2 checkpoint prefix"
         type: string
         required: true
-        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39376197341/1"
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39571667273/1"
       checkpoint_key:
         description: "Existing R2 Btrfs checkpoint object key"
         type: string
         required: true
-        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39376197341/1/checkpoint-a.btrfs"
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39571667273/1/checkpoint-roll.btrfs"
       checkpoint_subvol:
         description: "Readonly Btrfs subvolume name stored in the send stream"
         type: string
         required: true
-        default: "@checkpoint-a-39376197341-1"
+        default: "@checkpoint-roll-39571667273-1"
       checkpoint_bytes:
         description: "Expected checkpoint object size in bytes"
         type: string
         required: true
-        default: "86075547791"
+        default: "98994494004"
       origin_run_id:
         description: "GitHub run ID that created this checkpoint"
         type: string
         required: true
-        default: "39376197341"
+        default: "39571667273"
       origin_run_attempt:
         description: "GitHub run attempt that created this checkpoint"
         type: string
@@ -73,7 +73,7 @@ concurrency:
 
 jobs:
   resume:
-    name: Resume existing R2 checkpoint and finish ROM
+    name: Resume R2 checkpoint and finish ROM
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -137,8 +137,8 @@ jobs:
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
       SOONG_SWAP_DISK_RESERVE_GIB: "10"
-      HOST_ROOT_GUARD_GIB: "32"
-      HOST_ROOT_TRIM_TRIGGER_GIB: "40"
+      HOST_ROOT_GUARD_GIB: "18"
+      HOST_ROOT_TRIM_TRIGGER_GIB: "26"
       RESUME_SOFT_DEADLINE_MINUTES: "325"
       RBE_BUILD_MAX_ATTEMPTS: "2"
 
@@ -217,20 +217,41 @@ jobs:
           rm -rf /tmp/rclone-pinned
           df -h /
 
-      - name: Validate R2 handoff object
+      - name: Validate R2 handoff object and resolve checkpoint sidecars
         shell: bash
         run: |
           set -euo pipefail
           test -n "$CHECKPOINT_KEY"
           test -n "$CHECKPOINT_PREFIX"
           test -n "$CHECKPOINT_SUBVOL"
-          rclone lsf "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}" --files-only | tee /tmp/r2-resume-list.txt
-          rclone size "r2:${R2_BUCKET}/${CHECKPOINT_KEY}" --json | tee /tmp/r2-checkpoint-size.json
+
+          rclone lsf "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}" --files-only \
+            | tee /tmp/r2-resume-list.txt
+          rclone size "r2:${R2_BUCKET}/${CHECKPOINT_KEY}" --json \
+            | tee /tmp/r2-checkpoint-size.json
           ACTUAL="$(python3 -c 'import json; print(json.load(open("/tmp/r2-checkpoint-size.json")).get("bytes",0))')"
           if [ "$ACTUAL" != "$EXPECTED_CHECKPOINT_BYTES" ]; then
             echo "::error::R2 checkpoint size mismatch: expected=$EXPECTED_CHECKPOINT_BYTES actual=$ACTUAL"
             exit 1
           fi
+
+          CHECKPOINT_BASE="$(basename "$CHECKPOINT_KEY" .btrfs)"
+          CHECKPOINT_SHA_KEY="${CHECKPOINT_PREFIX}/${CHECKPOINT_BASE}.sha256"
+          CHECKPOINT_META_KEY="${CHECKPOINT_PREFIX}/metadata.json"
+
+          if ! rclone lsf "r2:${R2_BUCKET}/${CHECKPOINT_SHA_KEY}" --files-only 2>/dev/null | grep -q .; then
+            echo "::error::Missing checkpoint SHA sidecar: ${CHECKPOINT_SHA_KEY}"
+            exit 61
+          fi
+
+          echo "CHECKPOINT_SHA_KEY=$CHECKPOINT_SHA_KEY" >> "$GITHUB_ENV"
+          echo "CHECKPOINT_META_KEY=$CHECKPOINT_META_KEY" >> "$GITHUB_ENV"
+          {
+            echo "checkpoint_base=$CHECKPOINT_BASE"
+            echo "checkpoint_sha_key=$CHECKPOINT_SHA_KEY"
+            echo "checkpoint_meta_key=$CHECKPOINT_META_KEY"
+            echo "checkpoint_bytes=$ACTUAL"
+          } | tee /tmp/checkpoint-sidecars.txt
 
       - name: Stream Btrfs checkpoint from R2 and restore writable workspace
         working-directory: /home/runner/work
@@ -248,17 +269,18 @@ jobs:
           sudo mount -t btrfs -o "loop,compress=zstd:${BTRFS_ZSTD_LEVEL},noatime,discard=async,subvolid=5" \
             "$BACKING" "$TOP"
 
-          rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}/checkpoint-a.sha256" \
-            > /tmp/checkpoint-a-expected.sha256
+          test -n "${CHECKPOINT_SHA_KEY:-}"
+          rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_SHA_KEY}" \
+            > /tmp/checkpoint-expected.sha256
           HASHER=$'import hashlib,sys\nh=hashlib.sha256()\ni=sys.stdin.buffer\no=sys.stdout.buffer\nf=sys.argv[1]\nwhile True:\n    b=i.read(8*1024*1024)\n    if not b: break\n    h.update(b)\n    o.write(b)\n    o.flush()\nopen(f,"w").write(h.hexdigest()+"\\n")'
           set -o pipefail
           rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_KEY}" --stats 30s --stats-one-line \
-            | python3 -c "$HASHER" /tmp/checkpoint-a-received.sha256 \
+            | python3 -c "$HASHER" /tmp/checkpoint-received.sha256 \
             | sudo btrfs receive "$TOP" | tee /tmp/btrfs-receive.log
-          cmp -s /tmp/checkpoint-a-expected.sha256 /tmp/checkpoint-a-received.sha256 || {
+          cmp -s /tmp/checkpoint-expected.sha256 /tmp/checkpoint-received.sha256 || {
             echo '::error::Checkpoint SHA256 mismatch after R2 download.'
-            echo "expected=$(cat /tmp/checkpoint-a-expected.sha256)"
-            echo "received=$(cat /tmp/checkpoint-a-received.sha256)"
+            echo "expected=$(cat /tmp/checkpoint-expected.sha256)"
+            echo "received=$(cat /tmp/checkpoint-received.sha256)"
             exit 1
           }
 
@@ -291,11 +313,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          META=.ci-checkpoint/metadata.json
+
+          INTERNAL_META=.ci-checkpoint/metadata.json
+          EXTERNAL_META=/tmp/checkpoint-external-metadata.json
+          META_SOURCE=internal
+
+          # Rolling checkpoints publish authoritative metadata beside the Btrfs
+          # stream. Older checkpoint-a snapshots may only have internal metadata.
+          if [ -n "${CHECKPOINT_META_KEY:-}" ] && \
+             rclone lsf "r2:${R2_BUCKET}/${CHECKPOINT_META_KEY}" --files-only 2>/dev/null | grep -q .; then
+            rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_META_KEY}" > "$EXTERNAL_META"
+            META="$EXTERNAL_META"
+            META_SOURCE=external
+          else
+            META="$INTERNAL_META"
+          fi
+
           test -s "$META"
-          python3 - "$META" <<'PYVERIFY'
+          python3 - "$META" "$META_SOURCE" <<'PYVERIFY'
           import json, os, sys
-          d=json.load(open(sys.argv[1]))
+          path, source = sys.argv[1], sys.argv[2]
+          d=json.load(open(path))
           checks={
             'branch': os.environ['LINEAGE_BRANCH'],
             'device': 'starlte',
@@ -304,12 +342,33 @@ jobs:
             'github_run_attempt': os.environ['ORIGIN_RUN_ATTEMPT'],
             'checkpoint_prefix': os.environ['CHECKPOINT_PREFIX'],
           }
+          # New rolling metadata also identifies the exact readonly subvolume.
+          if source == 'external' and d.get('checkpoint_subvol') is not None:
+              checks['checkpoint_subvol'] = os.environ['CHECKPOINT_SUBVOL']
           bad=[]
           for k,v in checks.items():
-              if str(d.get(k,'')) != str(v): bad.append((k,d.get(k),v))
-          if bad: raise SystemExit('Checkpoint identity mismatch: '+repr(bad))
+              if str(d.get(k,'')) != str(v):
+                  bad.append((k,d.get(k),v))
+          if bad:
+              raise SystemExit('Checkpoint identity mismatch from %s metadata: %r' % (source,bad))
+          print('checkpoint_metadata_source='+source)
           print(json.dumps(d, indent=2, sort_keys=True))
           PYVERIFY
+
+          # The internal metadata of the first rolling checkpoint was inherited
+          # from its parent. It is not authoritative, but branch/device/target
+          # still must agree before we trust the restored workspace.
+          if [ "$META_SOURCE" = external ] && [ -s "$INTERNAL_META" ]; then
+            python3 - "$INTERNAL_META" <<'PYINTERNAL'
+          import json, os, sys
+          d=json.load(open(sys.argv[1]))
+          for k,v in {'branch':os.environ['LINEAGE_BRANCH'],'device':'starlte','target':'bacon'}.items():
+              if str(d.get(k,'')) != str(v):
+                  raise SystemExit('Internal checkpoint metadata mismatch: %s=%r expected %r' % (k,d.get(k),v))
+          print('internal_metadata_compatibility=PASS')
+          PYINTERNAL
+          fi
+
           rm -rf /tmp/rbe-test
 
           # DO NOT delete checkpoint rbe-diagnostics. The repo compatibility
@@ -321,8 +380,6 @@ jobs:
             exit 67
           fi
 
-          # Keep Job-B diagnostics separate so fresh RBE logs cannot overwrite or
-          # delete checkpoint support files.
           JOB_B_DIAG="$PWD/rbe-diagnostics-job-b"
           rm -rf "$JOB_B_DIAG"
           mkdir -p "$JOB_B_DIAG"
@@ -331,6 +388,8 @@ jobs:
           {
             printf 'restored_at=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             printf 'checkpoint_key=%s\n' "$CHECKPOINT_KEY"
+            printf 'checkpoint_sha_key=%s\n' "$CHECKPOINT_SHA_KEY"
+            printf 'checkpoint_metadata_source=%s\n' "$META_SOURCE"
             printf 'checkpoint_bytes=%s\n' "$EXPECTED_CHECKPOINT_BYTES"
             printf 'origin_run_id=%s\n' "$ORIGIN_RUN_ID"
             printf 'origin_run_attempt=%s\n' "$ORIGIN_RUN_ATTEMPT"
@@ -346,8 +405,9 @@ jobs:
           test -s /tmp/checkpoint-a-expected.sha256
           test -s /tmp/checkpoint-a-received.sha256
           cmp -s /tmp/checkpoint-a-expected.sha256 /tmp/checkpoint-a-received.sha256
-          cp /tmp/checkpoint-a-expected.sha256 /tmp/rbe-test/checkpoint-a-expected.sha256
-          cp /tmp/checkpoint-a-received.sha256 /tmp/rbe-test/checkpoint-a-received.sha256
+          cp /tmp/checkpoint-expected.sha256 /tmp/rbe-test/checkpoint-expected.sha256
+          cp /tmp/checkpoint-received.sha256 /tmp/rbe-test/checkpoint-received.sha256
+          cp /tmp/checkpoint-sidecars.txt /tmp/rbe-test/checkpoint-sidecars.txt
           echo "Verified checkpoint SHA256: $(cat /tmp/checkpoint-a-received.sha256)"
 
       - name: Verify restored repo manifest compatibility wrapper
@@ -1021,6 +1081,35 @@ jobs:
           sudo fstrim -v "$TOP" || true
 
           test -d "$LIVE"
+
+          # Make the rolling checkpoint self-describing before snapshotting it.
+          # This fixes the inherited-parent metadata problem seen in the first
+          # rolling checkpoint.
+          sudo python3 - "$LIVE/.ci-checkpoint/metadata.json" <<'PYROLLMETA'
+          import json, os, sys
+          p=sys.argv[1]
+          try:
+              d=json.load(open(p))
+          except Exception:
+              d={}
+          d.update({
+              "branch": os.environ["LINEAGE_BRANCH"],
+              "device": "starlte",
+              "target": "bacon",
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "checkpoint_prefix": f"lineage-checkpoints/bibicpu74/L23/{os.environ['LINEAGE_BRANCH']}/starlte/{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}",
+              "checkpoint_subvol": f"@checkpoint-roll-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+              "checkpoint_type": "rolling-full",
+              "parent_checkpoint_prefix": os.environ["CHECKPOINT_PREFIX"],
+          })
+          with open(p,'w') as f:
+              json.dump(d,f,indent=2,sort_keys=True)
+              f.write('\n')
+          PYROLLMETA
+          sudo chown "$(id -u):$(id -g)" "$LIVE/.ci-checkpoint/metadata.json" || true
+          sync
+
           if [ -e "$SNAP" ]; then
             sudo btrfs subvolume delete "$SNAP"
           fi
@@ -1046,22 +1135,15 @@ jobs:
 
           rclone copyto "$HASH_FILE" "r2:${R2_BUCKET}/${ROLL_SHA_KEY}"
 
-          python3 - "$META_FILE" <<'PYMETA'
-          import json, os, sys
-          p=sys.argv[1]
-          d={
-            "branch": os.environ["LINEAGE_BRANCH"],
-            "device": "starlte",
-            "target": "bacon",
-            "github_run_id": os.environ["GITHUB_RUN_ID"],
-            "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-            "parent_checkpoint_prefix": os.environ["CHECKPOINT_PREFIX"],
-            "checkpoint_prefix": f"lineage-checkpoints/bibicpu74/L23/{os.environ['LINEAGE_BRANCH']}/starlte/{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}",
-            "checkpoint_subvol": f"@checkpoint-roll-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
-            "reason": "${{ steps.resume_build.outputs.checkpoint_reason }}",
-            "progress": "${{ steps.resume_build.outputs.checkpoint_progress }}",
-          }
-          json.dump(d, open(p,"w"), indent=2, sort_keys=True)
+          python3 - "$LIVE/.ci-checkpoint/metadata.json" "$META_FILE" <<'PYMETA'
+          import json, sys
+          src,dst=sys.argv[1:3]
+          d=json.load(open(src))
+          d["reason"]="${{ steps.resume_build.outputs.checkpoint_reason }}"
+          d["progress"]="${{ steps.resume_build.outputs.checkpoint_progress }}"
+          with open(dst,"w") as f:
+              json.dump(d,f,indent=2,sort_keys=True)
+              f.write("\n")
           PYMETA
           rclone copyto "$META_FILE" "r2:${R2_BUCKET}/${ROLL_META_KEY}"
 
@@ -1092,13 +1174,13 @@ jobs:
           {
             echo '## Rolling LineageOS checkpoint created'
             echo
-            echo "- Progress: `${{ steps.resume_build.outputs.checkpoint_progress }}`"
-            echo "- Reason: `${{ steps.resume_build.outputs.checkpoint_reason }}`"
-            echo "- Prefix: \`$ROLL_PREFIX\`"
-            echo "- Key: \`$ROLL_KEY\`"
-            echo "- Subvolume: \`$SNAP_NAME\`"
-            echo "- Bytes: \`$ROLL_BYTES\`"
-            echo "- SHA256: \`$ROLL_SHA\`"
+            printf -- '- Progress: %s\n' '${{ steps.resume_build.outputs.checkpoint_progress }}'
+            printf -- '- Reason: %s\n' '${{ steps.resume_build.outputs.checkpoint_reason }}'
+            printf -- '- Prefix: %s\n' "$ROLL_PREFIX"
+            printf -- '- Key: %s\n' "$ROLL_KEY"
+            printf -- '- Subvolume: %s\n' "$SNAP_NAME"
+            printf -- '- Bytes: %s\n' "$ROLL_BYTES"
+            printf -- '- SHA256: %s\n' "$ROLL_SHA"
             echo
             echo 'Use these values for the next resume run. Keep the previous checkpoint until the new checkpoint has been restored and SHA-verified once.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -1136,7 +1218,8 @@ jobs:
           DST=/home/runner/work/los/resume-diagnostics
           [ -f /tmp/job-b-disk-after-restore.txt ] && cp /tmp/job-b-disk-after-restore.txt "$DST/" || true
           [ -f /tmp/rolling-checkpoint-remote-size.json ] && cp /tmp/rolling-checkpoint-remote-size.json "$DST/" || true
-          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt job-b-disk-monitor.log job-b-swap-policy.txt job-b-rolling-checkpoint.txt job-b-rolling-subvolume.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
+          [ -f /tmp/checkpoint-external-metadata.json ] && cp /tmp/checkpoint-external-metadata.json "$DST/" || true
+          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-expected.sha256 checkpoint-received.sha256 checkpoint-sidecars.txt resume-full-rom-build.log resume-build-attempts.txt job-b-disk-monitor.log job-b-swap-policy.txt job-b-rolling-checkpoint.txt job-b-rolling-subvolume.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
