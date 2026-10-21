@@ -1,4 +1,4 @@
-name: LineageOS starlte - Resume rolling checkpoint (parent-prune)
+name: LineageOS starlte - Final resume low-disk guard
 
 on:
   workflow_dispatch:
@@ -37,27 +37,27 @@ on:
         description: "Existing R2 checkpoint prefix"
         type: string
         required: true
-        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39617711245/1"
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39636178447/1"
       checkpoint_key:
         description: "Existing R2 Btrfs checkpoint object key"
         type: string
         required: true
-        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39617711245/1/checkpoint-roll.btrfs"
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39636178447/1/checkpoint-roll.btrfs"
       checkpoint_subvol:
         description: "Readonly Btrfs subvolume name stored in the send stream"
         type: string
         required: true
-        default: "@checkpoint-roll-39617711245-1"
+        default: "@checkpoint-roll-39636178447-1"
       checkpoint_bytes:
         description: "Expected checkpoint object size in bytes"
         type: string
         required: true
-        default: "113735252446"
+        default: "122302776526"
       origin_run_id:
         description: "GitHub run ID that created this checkpoint"
         type: string
         required: true
-        default: "39617711245"
+        default: "39636178447"
       origin_run_attempt:
         description: "GitHub run attempt that created this checkpoint"
         type: string
@@ -137,7 +137,7 @@ jobs:
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
       SOONG_SWAP_DISK_RESERVE_GIB: "10"
-      HOST_ROOT_GUARD_GIB: "10"
+      HOST_ROOT_GUARD_MIB: "100"
       HOST_ROOT_TRIM_TRIGGER_GIB: "16"
       RESUME_SOFT_DEADLINE_MINUTES: "325"
       RBE_BUILD_MAX_ATTEMPTS: "2"
@@ -146,7 +146,13 @@ jobs:
       - name: Reclaim root disk for resume runner
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          echo "RUN_START=$(date +%s)" >> "$GITHUB_ENV"
+          FREE_BEFORE="$(df -Pk / | awk 'NR==2 {print $4}')"
+          echo '=== BEFORE CLEANUP ==='
+          df -h /
+          free -h
+
           sudo swapoff -a || true
           sudo rm -f /swapfile /build-swap /mnt/swapfile /mnt/soong-swap-base || true
           sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
@@ -158,12 +164,21 @@ jobs:
             /usr/share/rust /usr/share/php* /usr/local/share/chromium \
             /usr/share/miniconda /usr/local/aws-cli /usr/local/aws-sam-cli \
             /usr/local/share/vcpkg /opt/google /opt/microsoft /usr/share/postgresql \
-            /usr/share/mysql /usr/local/julia* || true
+            /usr/share/mysql /usr/local/julia* /opt/az \
+            /usr/local/google-cloud-sdk /usr/lib/google-cloud-sdk \
+            /usr/local/share/gradle /usr/share/gradle /opt/pipx \
+            /home/runner/.gradle/caches /home/runner/.npm/_cacache \
+            /home/runner/.cache/pip /root/.cache/pip || true
           mkdir -p /home/runner/work/los
           sudo install -d -m 0755 /mnt/los-btrfs
           date +%s > /tmp/job-b-start-epoch.txt
+          FREE_AFTER="$(df -Pk / | awk 'NR==2 {print $4}')"
+          FREED_KIB=$((FREE_AFTER - FREE_BEFORE))
+          echo '=== AFTER CLEANUP ==='
           df -h /
           free -h
+          printf 'cleanup_freed_mib=%s\n' "$((FREED_KIB / 1024))" \
+            | tee /tmp/job-b-cleanup-space.txt
 
       - name: Install resume runner dependencies and pinned rclone
         working-directory: /home/runner/work
@@ -669,7 +684,7 @@ jobs:
             if swapon --noheadings --show=NAME | grep -q .; then
               echo 'Disk swap skipped: /mnt shares the host root filesystem and ZRAM is active.' \
                 | tee -a /tmp/rbe-test/job-b-swap-policy.txt
-            elif (( root_free_gib > HOST_ROOT_GUARD_GIB + 12 )); then
+            elif (( root_free_gib > 12 )); then
               target=4
               echo 'ZRAM unavailable; allowing only a 4 GiB emergency disk swap on root.' \
                 | tee -a /tmp/rbe-test/job-b-swap-policy.txt
@@ -958,12 +973,14 @@ jobs:
               reproxy_count="$(pgrep -xc reproxy 2>/dev/null || true)"
               reproxy_count="${reproxy_count:-0}"
 
-              host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
+              host_free_bytes="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+              host_free_mib=$(( host_free_bytes / 1048576 ))
+              host_free_gib=$(( host_free_bytes / 1073741824 ))
               btrfs_free_gib=$(( $(df -B1 --output=avail "$PWD" | tail -1 | tr -d ' ') / 1073741824 ))
               backing_used_gib=$(( $(du -B1 /tmp/los-workspace-btrfs.img 2>/dev/null | awk '{print $1}') / 1073741824 ))
               swap_used_gib="$(free -b | awk '/^Swap:/ {printf "%d", $3/1073741824}')"
 
-              disk_line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_mode=${JOB_B_RBE_MODE:-direct-remote} reproxy_processes=$reproxy_count host_root_free_gib=$host_free_gib btrfs_free_gib=$btrfs_free_gib backing_physical_gib=$backing_used_gib swap_used_gib=$swap_used_gib"
+              disk_line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_mode=${JOB_B_RBE_MODE:-direct-remote} reproxy_processes=$reproxy_count host_root_free_mib=$host_free_mib host_root_free_gib=$host_free_gib btrfs_free_gib=$btrfs_free_gib backing_physical_gib=$backing_used_gib swap_used_gib=$swap_used_gib"
               echo "$disk_line" | tee -a "$DISK_LOG"
 
               # If root begins getting tight, ask Btrfs/loop to punch unused
@@ -976,14 +993,16 @@ jobs:
                 sync
                 sudo fstrim -v "${BTRFS_TOP_MOUNT}" 2>&1 | tee -a "$DISK_LOG" || true
                 LAST_TRIM_EPOCH="$now"
-                host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
+                host_free_bytes="$(df -B1 --output=avail / | tail -1 | tr -d ' ')"
+                host_free_mib=$(( host_free_bytes / 1048576 ))
+                host_free_gib=$(( host_free_bytes / 1073741824 ))
                 backing_used_gib=$(( $(du -B1 /tmp/los-workspace-btrfs.img 2>/dev/null | awk '{print $1}') / 1073741824 ))
-                echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') post_trim host_root_free_gib=$host_free_gib backing_physical_gib=$backing_used_gib" \
+                echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') post_trim host_root_free_mib=$host_free_mib host_root_free_gib=$host_free_gib backing_physical_gib=$backing_used_gib" \
                   | tee -a "$DISK_LOG"
               fi
 
-              if (( host_free_gib <= HOST_ROOT_GUARD_GIB )); then
-                echo "::warning::Host root free space reached ${host_free_gib}GiB <= guard ${HOST_ROOT_GUARD_GIB}GiB; stopping Ninja for a rolling R2 checkpoint." \
+              if (( host_free_mib <= HOST_ROOT_GUARD_MIB )); then
+                echo "::warning::Host root free space reached ${host_free_mib}MiB <= guard ${HOST_ROOT_GUARD_MIB}MiB; stopping Ninja for a rolling R2 checkpoint." \
                   | tee -a "$DISK_LOG"
                 CHECKPOINT_REQUESTED=1
                 CHECKPOINT_REASON='host_root_disk_guard'
@@ -999,7 +1018,11 @@ jobs:
                 stop_tree "$PID"
                 break
               fi
-              if (( host_free_gib <= 20 )); then
+              if (( host_free_mib <= 2048 )); then
+                sleep 2
+              elif (( host_free_mib <= 5120 )); then
+                sleep 5
+              elif (( host_free_gib <= 20 )); then
                 sleep 10
               else
                 sleep 30
@@ -1287,6 +1310,7 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
+          [ -f /tmp/job-b-cleanup-space.txt ] && cp /tmp/job-b-cleanup-space.txt "$DST/" || true
           [ -f /tmp/job-b-disk-after-restore.txt ] && cp /tmp/job-b-disk-after-restore.txt "$DST/" || true
           [ -f /tmp/btrfs-job-b-parent-prune.log ] && cp /tmp/btrfs-job-b-parent-prune.log "$DST/job-b-parent-prune.log" || true
           [ -f /tmp/rolling-checkpoint-remote-size.json ] && cp /tmp/rolling-checkpoint-remote-size.json "$DST/" || true
