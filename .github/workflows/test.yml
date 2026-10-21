@@ -1,4 +1,4 @@
-name: LineageOS starlte - Resume any R2 checkpoint
+name: LineageOS starlte - Resume rolling checkpoint (parent-prune)
 
 on:
   workflow_dispatch:
@@ -37,27 +37,27 @@ on:
         description: "Existing R2 checkpoint prefix"
         type: string
         required: true
-        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39571667273/1"
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39617711245/1"
       checkpoint_key:
         description: "Existing R2 Btrfs checkpoint object key"
         type: string
         required: true
-        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39571667273/1/checkpoint-roll.btrfs"
+        default: "lineage-checkpoints/bibicpu74/L23/lineage-23.2/starlte/39617711245/1/checkpoint-roll.btrfs"
       checkpoint_subvol:
         description: "Readonly Btrfs subvolume name stored in the send stream"
         type: string
         required: true
-        default: "@checkpoint-roll-39571667273-1"
+        default: "@checkpoint-roll-39617711245-1"
       checkpoint_bytes:
         description: "Expected checkpoint object size in bytes"
         type: string
         required: true
-        default: "98994494004"
+        default: "113735252446"
       origin_run_id:
         description: "GitHub run ID that created this checkpoint"
         type: string
         required: true
-        default: "39571667273"
+        default: "39617711245"
       origin_run_attempt:
         description: "GitHub run attempt that created this checkpoint"
         type: string
@@ -137,8 +137,8 @@ jobs:
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
       SOONG_SWAP_DISK_RESERVE_GIB: "10"
-      HOST_ROOT_GUARD_GIB: "18"
-      HOST_ROOT_TRIM_TRIGGER_GIB: "26"
+      HOST_ROOT_GUARD_GIB: "10"
+      HOST_ROOT_TRIM_TRIGGER_GIB: "16"
       RESUME_SOFT_DEADLINE_MINUTES: "325"
       RBE_BUILD_MAX_ATTEMPTS: "2"
 
@@ -293,14 +293,41 @@ jobs:
           fi
           sudo btrfs subvolume snapshot "$RECEIVED" "$TOP/@los" | tee /tmp/btrfs-job-b-writable-snapshot.log
           sudo chown "$(id -u):$(id -g)" "$TOP/@los"
+
+          # IMPORTANT: @los now references the same extents as the received
+          # readonly checkpoint. Keeping the readonly parent would pin every old
+          # extent while Ninja replaces outputs, causing the sparse backing file
+          # to grow rapidly. This workflow creates full rolling sends, not
+          # incremental parent-based sends, so the received parent is no longer
+          # needed after @los exists.
+          {
+            echo "received_parent=$RECEIVED"
+            echo "writable_child=$TOP/@los"
+            echo "before_delete_host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))"
+            echo "before_delete_backing_physical_gib=$(( $(du -B1 "$BACKING" | awk '{print $1}') / 1073741824 ))"
+          } | tee /tmp/btrfs-job-b-parent-prune.log
+
+          sudo btrfs subvolume delete "$RECEIVED" | tee -a /tmp/btrfs-job-b-parent-prune.log
+          if sudo btrfs subvolume list "$TOP" | grep -Fq "path ${CHECKPOINT_SUBVOL}"; then
+            echo "::error::Received readonly parent still exists after delete: $CHECKPOINT_SUBVOL"
+            exit 73
+          fi
+
+          sync
+          sudo btrfs filesystem sync "$TOP" || true
+          sudo fstrim -v "$TOP" | tee -a /tmp/btrfs-job-b-parent-prune.log || true
+
+          {
+            echo "after_delete_host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))"
+            echo "after_delete_backing_physical_gib=$(( $(du -B1 "$BACKING" | awk '{print $1}') / 1073741824 ))"
+          } | tee -a /tmp/btrfs-job-b-parent-prune.log
+
           sudo mount --bind "$TOP/@los" "$WORKSPACE"
           test "$(stat -f -c '%T' "$WORKSPACE")" = btrfs
           df -hT / "$TOP" "$WORKSPACE"
           sudo btrfs filesystem usage -b "$TOP" | head -80
 
-          # Reclaim any free extents in the restored sparse loop image and record
-          # host-vs-Btrfs accounting separately.
-          sudo fstrim -v "$TOP" || true
+          # Record host-vs-Btrfs accounting separately.
           HOST_FREE_GIB=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
           BTRFS_FREE_GIB=$(( $(df -B1 --output=avail "$WORKSPACE" | tail -1 | tr -d ' ') / 1073741824 ))
           BACKING_USED_GIB=$(( $(du -B1 "$BACKING" | awk '{print $1}') / 1073741824 ))
@@ -928,7 +955,8 @@ jobs:
             while kill -0 "$PID" 2>/dev/null; do
               now="$(date +%s)"
               progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$ATTEMPT_LOG" | tail -1 || true)"
-              reproxy_count="$(pgrep -xc reproxy 2>/dev/null || echo 0)"
+              reproxy_count="$(pgrep -xc reproxy 2>/dev/null || true)"
+              reproxy_count="${reproxy_count:-0}"
 
               host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
               btrfs_free_gib=$(( $(df -B1 --output=avail "$PWD" | tail -1 | tr -d ' ') / 1073741824 ))
@@ -939,10 +967,10 @@ jobs:
               echo "$disk_line" | tee -a "$DISK_LOG"
 
               # If root begins getting tight, ask Btrfs/loop to punch unused
-              # extents out of the sparse host file. Rate-limit this to once
-              # every 10 minutes.
+              # extents out of the sparse host file. Under low-root pressure,
+              # rate-limit this to once every 2 minutes.
               if (( host_free_gib <= HOST_ROOT_TRIM_TRIGGER_GIB )) && \
-                 (( now - LAST_TRIM_EPOCH >= 600 )); then
+                 (( now - LAST_TRIM_EPOCH >= 120 )); then
                 echo "::warning::Host root free=${host_free_gib}GiB; issuing sync + fstrim before the hard guard." \
                   | tee -a "$DISK_LOG"
                 sync
@@ -971,7 +999,11 @@ jobs:
                 stop_tree "$PID"
                 break
               fi
-              sleep 30
+              if (( host_free_gib <= 20 )); then
+                sleep 10
+              else
+                sleep 30
+              fi
             done
 
             set +e
@@ -1256,9 +1288,10 @@ jobs:
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
           [ -f /tmp/job-b-disk-after-restore.txt ] && cp /tmp/job-b-disk-after-restore.txt "$DST/" || true
+          [ -f /tmp/btrfs-job-b-parent-prune.log ] && cp /tmp/btrfs-job-b-parent-prune.log "$DST/job-b-parent-prune.log" || true
           [ -f /tmp/rolling-checkpoint-remote-size.json ] && cp /tmp/rolling-checkpoint-remote-size.json "$DST/" || true
           [ -f /tmp/checkpoint-external-metadata.json ] && cp /tmp/checkpoint-external-metadata.json "$DST/" || true
-          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-expected.sha256 checkpoint-received.sha256 checkpoint-sidecars.txt resume-full-rom-build.log resume-build-attempts.txt job-b-disk-monitor.log job-b-swap-policy.txt job-b-rolling-checkpoint.txt job-b-rolling-subvolume.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
+          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-expected.sha256 checkpoint-received.sha256 checkpoint-sidecars.txt resume-full-rom-build.log resume-build-attempts.txt job-b-disk-monitor.log job-b-swap-policy.txt job-b-parent-prune.log job-b-rolling-checkpoint.txt job-b-rolling-subvolume.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
