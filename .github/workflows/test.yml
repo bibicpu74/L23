@@ -402,13 +402,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -s /tmp/checkpoint-a-expected.sha256
-          test -s /tmp/checkpoint-a-received.sha256
-          cmp -s /tmp/checkpoint-a-expected.sha256 /tmp/checkpoint-a-received.sha256
+          test -s /tmp/checkpoint-expected.sha256
+          test -s /tmp/checkpoint-received.sha256
+          cmp -s /tmp/checkpoint-expected.sha256 /tmp/checkpoint-received.sha256
           cp /tmp/checkpoint-expected.sha256 /tmp/rbe-test/checkpoint-expected.sha256
           cp /tmp/checkpoint-received.sha256 /tmp/rbe-test/checkpoint-received.sha256
           cp /tmp/checkpoint-sidecars.txt /tmp/rbe-test/checkpoint-sidecars.txt
-          echo "Verified checkpoint SHA256: $(cat /tmp/checkpoint-a-received.sha256)"
+          echo "Verified checkpoint SHA256: $(cat /tmp/checkpoint-received.sha256)"
 
       - name: Verify restored repo manifest compatibility wrapper
         working-directory: /home/runner/work/los
