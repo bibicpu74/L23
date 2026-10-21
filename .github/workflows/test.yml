@@ -1083,31 +1083,70 @@ jobs:
           test -d "$LIVE"
 
           # Make the rolling checkpoint self-describing before snapshotting it.
-          # This fixes the inherited-parent metadata problem seen in the first
-          # rolling checkpoint.
-          sudo python3 - "$LIVE/.ci-checkpoint/metadata.json" <<'PYROLLMETA'
-          import json, os, sys
-          p=sys.argv[1]
+          # Do not run this Python under sudo: sudo sanitizes GitHub's environment
+          # and previously removed LINEAGE_BRANCH/GITHUB_RUN_ID.
+          BASE_META=/tmp/rolling-base-metadata.json
+          NEW_META=/tmp/rolling-internal-metadata.json
+          rm -f "$BASE_META" "$NEW_META"
+
+          if [ -s "$LIVE/.ci-checkpoint/metadata.json" ]; then
+            sudo cp "$LIVE/.ci-checkpoint/metadata.json" "$BASE_META"
+            sudo chown "$(id -u):$(id -g)" "$BASE_META"
+          else
+            printf '{}\n' > "$BASE_META"
+          fi
+
+          python3 - \
+            "$BASE_META" \
+            "$NEW_META" \
+            "$LINEAGE_BRANCH" \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" \
+            "$CHECKPOINT_PREFIX" <<'PYROLLMETA'
+          import json, sys
+          base, out, branch, run_id, run_attempt, parent_prefix = sys.argv[1:7]
           try:
-              d=json.load(open(p))
+              with open(base) as f:
+                  d=json.load(f)
           except Exception:
               d={}
+          prefix=f"lineage-checkpoints/bibicpu74/L23/{branch}/starlte/{run_id}/{run_attempt}"
           d.update({
-              "branch": os.environ["LINEAGE_BRANCH"],
+              "branch": branch,
               "device": "starlte",
               "target": "bacon",
-              "github_run_id": os.environ["GITHUB_RUN_ID"],
-              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              "checkpoint_prefix": f"lineage-checkpoints/bibicpu74/L23/{os.environ['LINEAGE_BRANCH']}/starlte/{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}",
-              "checkpoint_subvol": f"@checkpoint-roll-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+              "github_run_id": run_id,
+              "github_run_attempt": run_attempt,
+              "checkpoint_prefix": prefix,
+              "checkpoint_subvol": f"@checkpoint-roll-{run_id}-{run_attempt}",
               "checkpoint_type": "rolling-full",
-              "parent_checkpoint_prefix": os.environ["CHECKPOINT_PREFIX"],
+              "parent_checkpoint_prefix": parent_prefix,
           })
-          with open(p,'w') as f:
+          with open(out,'w') as f:
               json.dump(d,f,indent=2,sort_keys=True)
               f.write('\n')
           PYROLLMETA
-          sudo chown "$(id -u):$(id -g)" "$LIVE/.ci-checkpoint/metadata.json" || true
+
+          test -s "$NEW_META"
+          python3 - "$NEW_META" "$LINEAGE_BRANCH" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PYROLLVERIFY'
+          import json,sys
+          p,branch,run_id,run_attempt=sys.argv[1:5]
+          d=json.load(open(p))
+          expected={
+              "branch":branch,
+              "device":"starlte",
+              "target":"bacon",
+              "github_run_id":run_id,
+              "github_run_attempt":run_attempt,
+              "checkpoint_subvol":f"@checkpoint-roll-{run_id}-{run_attempt}",
+          }
+          bad=[(k,d.get(k),v) for k,v in expected.items() if str(d.get(k,'')) != str(v)]
+          if bad:
+              raise SystemExit("rolling metadata verification failed: "+repr(bad))
+          print("rolling_metadata_pre_snapshot=PASS")
+          PYROLLVERIFY
+
+          sudo install -D -m 0644 "$NEW_META" "$LIVE/.ci-checkpoint/metadata.json"
           sync
 
           if [ -e "$SNAP" ]; then
