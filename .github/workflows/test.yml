@@ -1,4 +1,4 @@
-name: LineageOS starlte - Resume existing R2 checkpoint1
+name: LineageOS starlte - Resume existing R2 checkpoint
 
 on:
   workflow_dispatch:
@@ -106,7 +106,7 @@ jobs:
       RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
       RCLONE_CONFIG_R2_REGION: "auto"
       PINNED_RCLONE_VERSION: "1.75.2"
-      RECLIENT_CIPD_VERSION: "latest"
+      RECLIENT_CIPD_VERSION: "lc9VuwVg1WOqyGRtORz6yQvvim8f8iZzNtAsIt4vR9oC"
       PINNED_RECLIENT_PACKAGE: "infra/rbe/client/linux-amd64-csd"
 
       USE_RBE: "true"
@@ -293,12 +293,32 @@ jobs:
           print(json.dumps(d, indent=2, sort_keys=True))
           PYVERIFY
           rm -rf /tmp/rbe-test
-          rm -rf rbe-diagnostics
-          mkdir -p rbe-diagnostics
-          ln -s "$PWD/rbe-diagnostics" /tmp/rbe-test
-          printf 'restored_at=%s\ncheckpoint_key=%s\ncheckpoint_bytes=%s\norigin_run_id=%s\norigin_run_attempt=%s\n' \
-            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$CHECKPOINT_KEY" "$EXPECTED_CHECKPOINT_BYTES" \
-            "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" > /tmp/rbe-test/job-b-restore.txt
+
+          # DO NOT delete checkpoint rbe-diagnostics. The repo compatibility
+          # wrapper restored in .repo/repo/repo reads this locked manifest when
+          # Lineage generates build-manifest.xml late in the build.
+          LOCKED_MANIFEST="$PWD/rbe-diagnostics/source-manifest-locked.xml"
+          if [ ! -s "$LOCKED_MANIFEST" ]; then
+            echo "::error::Missing locked source manifest required by restored repo wrapper: $LOCKED_MANIFEST"
+            exit 67
+          fi
+
+          # Keep Job-B diagnostics separate so fresh RBE logs cannot overwrite or
+          # delete checkpoint support files.
+          JOB_B_DIAG="$PWD/rbe-diagnostics-job-b"
+          rm -rf "$JOB_B_DIAG"
+          mkdir -p "$JOB_B_DIAG"
+          ln -s "$JOB_B_DIAG" /tmp/rbe-test
+
+          {
+            printf 'restored_at=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            printf 'checkpoint_key=%s\n' "$CHECKPOINT_KEY"
+            printf 'checkpoint_bytes=%s\n' "$EXPECTED_CHECKPOINT_BYTES"
+            printf 'origin_run_id=%s\n' "$ORIGIN_RUN_ID"
+            printf 'origin_run_attempt=%s\n' "$ORIGIN_RUN_ATTEMPT"
+            printf 'locked_manifest=%s\n' "$LOCKED_MANIFEST"
+            printf 'locked_manifest_sha256=%s\n' "$(sha256sum "$LOCKED_MANIFEST" | awk '{print $1}')"
+          } > /tmp/rbe-test/job-b-restore.txt
 
       - name: Record verified streamed checkpoint SHA256
         working-directory: /home/runner/work/los
@@ -311,6 +331,43 @@ jobs:
           cp /tmp/checkpoint-a-expected.sha256 /tmp/rbe-test/checkpoint-a-expected.sha256
           cp /tmp/checkpoint-a-received.sha256 /tmp/rbe-test/checkpoint-a-received.sha256
           echo "Verified checkpoint SHA256: $(cat /tmp/checkpoint-a-received.sha256)"
+
+      - name: Verify restored repo manifest compatibility wrapper
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCKED_MANIFEST="$PWD/rbe-diagnostics/source-manifest-locked.xml"
+          TEST_MANIFEST=/tmp/job-b-manifest-test.xml
+          LOG=/tmp/rbe-test/job-b-repo-manifest-preflight.txt
+
+          test -s "$LOCKED_MANIFEST"
+          test -x .repo/repo/repo
+
+          rm -f "$TEST_MANIFEST"
+          set +e
+          REPO_TRACE=0 python3 .repo/repo/repo manifest -o "$TEST_MANIFEST" -r \
+            >"$LOG" 2>&1
+          rc=$?
+          set -e
+
+          if [ "$rc" -ne 0 ] || [ ! -s "$TEST_MANIFEST" ]; then
+            echo "::error::Restored repo manifest compatibility check failed (rc=$rc)."
+            cat "$LOG" || true
+            exit 68
+          fi
+
+          if ! grep -q '<manifest' "$TEST_MANIFEST"; then
+            echo '::error::repo manifest preflight produced an invalid manifest file.'
+            head -80 "$TEST_MANIFEST" || true
+            exit 69
+          fi
+
+          {
+            echo "repo_manifest_preflight=PASS"
+            echo "locked_manifest_sha256=$(sha256sum "$LOCKED_MANIFEST" | awk '{print $1}')"
+            echo "generated_manifest_bytes=$(stat -c %s "$TEST_MANIFEST")"
+          } | tee -a "$LOG"
 
       - name: Install and verify legacy ncurses5 for restored RenderScript tools
         working-directory: /home/runner/work/los
@@ -414,9 +471,8 @@ jobs:
             "$CIPD" version
           } | tee -a "$LOG"
 
-          # For this diagnostic run use the package's public latest ref.
-          # The resolved CIPD instance metadata is logged below so a successful
-          # RBE run can be pinned exactly afterward.
+          # Use the exact CIPD instance proven by the successful direct-RBE run.
+          # This prevents a moving 'latest' ref from changing Reclient between runs.
           printf '%s %s\n' "$PINNED_RECLIENT_PACKAGE" \
             "$RECLIENT_CIPD_VERSION" > "$ENSURE"
           cat "$ENSURE" | tee -a "$LOG"
@@ -862,7 +918,7 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
-          for f in job-b-restore.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
+          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
