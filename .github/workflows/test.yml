@@ -137,6 +137,8 @@ jobs:
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
       SOONG_SWAP_DISK_RESERVE_GIB: "10"
+      HOST_ROOT_GUARD_GIB: "32"
+      HOST_ROOT_TRIM_TRIGGER_GIB: "40"
       RESUME_SOFT_DEADLINE_MINUTES: "325"
       RBE_BUILD_MAX_ATTEMPTS: "2"
 
@@ -209,6 +211,12 @@ jobs:
           btrfs version
           zstd --version
 
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* || true
+          rm -f "$RCLONE_ZIP" "$RCLONE_SUMS"
+          rm -rf /tmp/rclone-pinned
+          df -h /
+
       - name: Validate R2 handoff object
         shell: bash
         run: |
@@ -237,7 +245,7 @@ jobs:
           test -z "$(ls -A "$WORKSPACE")"
           truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
           sudo mkfs.btrfs -f -m single -d single "$BACKING" >/tmp/btrfs-job-b-mkfs.log 2>&1
-          sudo mount -t btrfs -o "loop,compress=zstd:${BTRFS_ZSTD_LEVEL},noatime,subvolid=5" \
+          sudo mount -t btrfs -o "loop,compress=zstd:${BTRFS_ZSTD_LEVEL},noatime,discard=async,subvolid=5" \
             "$BACKING" "$TOP"
 
           rclone cat "r2:${R2_BUCKET}/${CHECKPOINT_PREFIX}/checkpoint-a.sha256" \
@@ -267,6 +275,16 @@ jobs:
           test "$(stat -f -c '%T' "$WORKSPACE")" = btrfs
           df -hT / "$TOP" "$WORKSPACE"
           sudo btrfs filesystem usage -b "$TOP" | head -80
+
+          # Reclaim any free extents in the restored sparse loop image and record
+          # host-vs-Btrfs accounting separately.
+          sudo fstrim -v "$TOP" || true
+          HOST_FREE_GIB=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
+          BTRFS_FREE_GIB=$(( $(df -B1 --output=avail "$WORKSPACE" | tail -1 | tr -d ' ') / 1073741824 ))
+          BACKING_USED_GIB=$(( $(du -B1 "$BACKING" | awk '{print $1}') / 1073741824 ))
+          printf 'after_restore host_root_free_gib=%s btrfs_free_gib=%s backing_physical_gib=%s\n' \
+            "$HOST_FREE_GIB" "$BTRFS_FREE_GIB" "$BACKING_USED_GIB" \
+            | tee /tmp/job-b-disk-after-restore.txt
 
       - name: Reattach diagnostics and verify checkpoint identity
         working-directory: /home/runner/work/los
@@ -531,33 +549,65 @@ jobs:
             echo 'upgrade_result=PASS'
           } | tee -a "$LOG"
 
-      - name: Configure hybrid ZRAM and disk swap for resume
+          rm -rf "$NEW" "$CIPD_BOOT" "$ENSURE"
+          rm -f "$CIPD"
+          df -h /
+
+      - name: Configure host-safe ZRAM and optional disk swap
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/rbe-test
           BASE_SWAP=/mnt/soong-swap-base
+
+          # Prefer compressed RAM swap. A disk swap file on the same filesystem
+          # as / competes directly with the sparse Btrfs image and the runner's
+          # own _diag logs, so do not allocate it when /mnt shares the root FS.
           sudo modprobe zram num_devices=1 2>/tmp/rbe-test/zram-resume-errors.log || true
           zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" 2>>/tmp/rbe-test/zram-resume-errors.log || true)"
           if [ -n "$zram_dev" ] && [ -b "$zram_dev" ]; then
             sudo mkswap -f "$zram_dev" >/dev/null
             sudo swapon --priority 100 "$zram_dev"
           fi
-          disk_free_gib=$(( $(df -B1 --output=avail /mnt | tail -1 | tr -d ' ') / 1073741824 ))
-          target="${SOONG_DISK_SWAP_GIB}"
-          if (( disk_free_gib - SOONG_SWAP_DISK_RESERVE_GIB < target )); then
-            target=$((disk_free_gib - SOONG_SWAP_DISK_RESERVE_GIB))
+
+          root_dev="$(findmnt -n -o MAJ:MIN -T /)"
+          mnt_dev="$(findmnt -n -o MAJ:MIN -T /mnt)"
+          root_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
+          target=0
+
+          if [ "$root_dev" = "$mnt_dev" ]; then
+            echo "root_and_mnt_same_device=true root_dev=$root_dev root_free_gib=$root_free_gib" \
+              | tee /tmp/rbe-test/job-b-swap-policy.txt
+            if swapon --noheadings --show=NAME | grep -q .; then
+              echo 'Disk swap skipped: /mnt shares the host root filesystem and ZRAM is active.' \
+                | tee -a /tmp/rbe-test/job-b-swap-policy.txt
+            elif (( root_free_gib > HOST_ROOT_GUARD_GIB + 12 )); then
+              target=4
+              echo 'ZRAM unavailable; allowing only a 4 GiB emergency disk swap on root.' \
+                | tee -a /tmp/rbe-test/job-b-swap-policy.txt
+            fi
+          else
+            disk_free_gib=$(( $(df -B1 --output=avail /mnt | tail -1 | tr -d ' ') / 1073741824 ))
+            target="${SOONG_DISK_SWAP_GIB}"
+            if (( disk_free_gib - SOONG_SWAP_DISK_RESERVE_GIB < target )); then
+              target=$((disk_free_gib - SOONG_SWAP_DISK_RESERVE_GIB))
+            fi
+            echo "root_and_mnt_same_device=false root_dev=$root_dev mnt_dev=$mnt_dev mnt_free_gib=$disk_free_gib target_swap_gib=$target" \
+              | tee /tmp/rbe-test/job-b-swap-policy.txt
           fi
+
           if (( target >= 4 )); then
             sudo fallocate -l "${target}G" "$BASE_SWAP"
             sudo chmod 600 "$BASE_SWAP"
             sudo mkswap "$BASE_SWAP" >/dev/null
             sudo swapon --priority 20 "$BASE_SWAP"
           fi
+
           sudo sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
           swapon --show
           free -h
+          df -h /
           if ! swapon --noheadings --show=NAME | grep -q .; then
             echo '::error::No active swap on resume runner.'
             exit 1
@@ -766,8 +816,13 @@ jobs:
           DEADLINE=$((START + RESUME_SOFT_DEADLINE_MINUTES * 60))
           LOG=/tmp/rbe-test/resume-full-rom-build.log
           ATTEMPTS_LOG=/tmp/rbe-test/resume-build-attempts.txt
+          DISK_LOG=/tmp/rbe-test/job-b-disk-monitor.log
           : > "$LOG"
           : > "$ATTEMPTS_LOG"
+          : > "$DISK_LOG"
+
+          echo 'completed=false' >> "$GITHUB_OUTPUT"
+          echo 'checkpoint_requested=false' >> "$GITHUB_OUTPUT"
 
           stop_tree() {
             local p="$1" c
@@ -782,8 +837,10 @@ jobs:
           while (( ATTEMPT <= MAX_ATTEMPTS )); do
             now="$(date +%s)"
             if (( now >= DEADLINE )); then
-              echo '::error::Job B resume soft deadline reached before starting another build attempt.'
-              exit 124
+              echo '::warning::Job B soft deadline reached before another attempt; requesting a rolling checkpoint.'
+              echo 'checkpoint_requested=true' >> "$GITHUB_OUTPUT"
+              echo 'checkpoint_reason=soft_deadline_before_attempt' >> "$GITHUB_OUTPUT"
+              exit 0
             fi
 
             ATTEMPT_LOG="/tmp/rbe-test/resume-full-rom-build-attempt-${ATTEMPT}.log"
@@ -804,16 +861,53 @@ jobs:
               echo "${PIPESTATUS[0]}" > "$STATUS"
             ) &
             PID=$!
-            DEADLINE_HIT=0
+            CHECKPOINT_REQUESTED=0
+            CHECKPOINT_REASON=''
+            LAST_TRIM_EPOCH=0
 
             while kill -0 "$PID" 2>/dev/null; do
               now="$(date +%s)"
               progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$ATTEMPT_LOG" | tail -1 || true)"
               reproxy_count="$(pgrep -xc reproxy 2>/dev/null || echo 0)"
-              echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_mode=${JOB_B_RBE_MODE:-direct-remote} reproxy_processes=$reproxy_count free_gib=$(( $(df -B1 --output=avail . | tail -1 | tr -d ' ') / 1073741824 ))"
+
+              host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
+              btrfs_free_gib=$(( $(df -B1 --output=avail "$PWD" | tail -1 | tr -d ' ') / 1073741824 ))
+              backing_used_gib=$(( $(du -B1 /tmp/los-workspace-btrfs.img 2>/dev/null | awk '{print $1}') / 1073741824 ))
+              swap_used_gib="$(free -b | awk '/^Swap:/ {printf "%d", $3/1073741824}')"
+
+              disk_line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') attempt=${ATTEMPT}/${MAX_ATTEMPTS} progress=${progress:-unknown} rbe_mode=${JOB_B_RBE_MODE:-direct-remote} reproxy_processes=$reproxy_count host_root_free_gib=$host_free_gib btrfs_free_gib=$btrfs_free_gib backing_physical_gib=$backing_used_gib swap_used_gib=$swap_used_gib"
+              echo "$disk_line" | tee -a "$DISK_LOG"
+
+              # If root begins getting tight, ask Btrfs/loop to punch unused
+              # extents out of the sparse host file. Rate-limit this to once
+              # every 10 minutes.
+              if (( host_free_gib <= HOST_ROOT_TRIM_TRIGGER_GIB )) && \
+                 (( now - LAST_TRIM_EPOCH >= 600 )); then
+                echo "::warning::Host root free=${host_free_gib}GiB; issuing sync + fstrim before the hard guard." \
+                  | tee -a "$DISK_LOG"
+                sync
+                sudo fstrim -v "${BTRFS_TOP_MOUNT}" 2>&1 | tee -a "$DISK_LOG" || true
+                LAST_TRIM_EPOCH="$now"
+                host_free_gib=$(( $(df -B1 --output=avail / | tail -1 | tr -d ' ') / 1073741824 ))
+                backing_used_gib=$(( $(du -B1 /tmp/los-workspace-btrfs.img 2>/dev/null | awk '{print $1}') / 1073741824 ))
+                echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') post_trim host_root_free_gib=$host_free_gib backing_physical_gib=$backing_used_gib" \
+                  | tee -a "$DISK_LOG"
+              fi
+
+              if (( host_free_gib <= HOST_ROOT_GUARD_GIB )); then
+                echo "::warning::Host root free space reached ${host_free_gib}GiB <= guard ${HOST_ROOT_GUARD_GIB}GiB; stopping Ninja for a rolling R2 checkpoint." \
+                  | tee -a "$DISK_LOG"
+                CHECKPOINT_REQUESTED=1
+                CHECKPOINT_REASON='host_root_disk_guard'
+                stop_tree "$PID"
+                break
+              fi
+
               if (( now >= DEADLINE )); then
-                echo '::error::Job B resume soft deadline reached before ROM completion.'
-                DEADLINE_HIT=1
+                echo '::warning::Job B soft deadline reached; stopping Ninja for a rolling R2 checkpoint.' \
+                  | tee -a "$DISK_LOG"
+                CHECKPOINT_REQUESTED=1
+                CHECKPOINT_REASON='soft_deadline'
                 stop_tree "$PID"
                 break
               fi
@@ -827,8 +921,14 @@ jobs:
             RC="$WAIT_RC"
             [ -s "$STATUS" ] && RC="$(cat "$STATUS")"
 
-            if (( DEADLINE_HIT == 1 )); then
-              exit 124
+            if (( CHECKPOINT_REQUESTED == 1 )); then
+              progress="$(grep -aoE '\[[[:space:]]*[0-9]+%[[:space:]]+[0-9]+/[0-9]+\]' "$ATTEMPT_LOG" | tail -1 || true)"
+              sync
+              echo "checkpoint_requested=true" >> "$GITHUB_OUTPUT"
+              echo "checkpoint_reason=${CHECKPOINT_REASON}" >> "$GITHUB_OUTPUT"
+              echo "checkpoint_progress=${progress:-unknown}" >> "$GITHUB_OUTPUT"
+              echo "attempt=${ATTEMPT} result=rolling_checkpoint reason=${CHECKPOINT_REASON} progress=${progress:-unknown}"                 | tee -a "$ATTEMPTS_LOG"
+              exit 0
             fi
 
             if [ "$RC" -eq 0 ]; then
@@ -887,6 +987,122 @@ jobs:
           echo "rom_zip=$ROM_ZIP" >> "$GITHUB_OUTPUT"
           echo 'completed=true' >> "$GITHUB_OUTPUT"
 
+      - name: Stream rolling Btrfs checkpoint to R2
+        id: rolling_checkpoint
+        if: ${{ steps.resume_build.outputs.checkpoint_requested == 'true' }}
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOP="${BTRFS_TOP_MOUNT}"
+          LIVE="$TOP/@los"
+          SNAP_NAME="@checkpoint-roll-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SNAP="$TOP/$SNAP_NAME"
+          ROLL_PREFIX="lineage-checkpoints/bibicpu74/L23/${LINEAGE_BRANCH}/starlte/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
+          ROLL_KEY="${ROLL_PREFIX}/checkpoint-roll.btrfs"
+          ROLL_SHA_KEY="${ROLL_PREFIX}/checkpoint-roll.sha256"
+          ROLL_META_KEY="${ROLL_PREFIX}/metadata.json"
+          HASH_FILE=/tmp/rolling-checkpoint.sha256
+          BYTES_FILE=/tmp/rolling-checkpoint.bytes
+          META_FILE=/tmp/rolling-checkpoint-metadata.json
+
+          echo "rolling_checkpoint_reason=${{ steps.resume_build.outputs.checkpoint_reason }}"
+          echo "rolling_checkpoint_progress=${{ steps.resume_build.outputs.checkpoint_progress }}"
+
+          # Ensure no build/reproxy process is still writing before the readonly snapshot.
+          if pgrep -x reproxy >/dev/null; then
+            timeout 45s "$RBE_DIR/bootstrap" -shutdown -output_dir=/tmp/rbe-test \
+              >/tmp/rbe-test/job-b-rolling-reproxy-shutdown.log 2>&1 || true
+            pkill -x reproxy 2>/dev/null || true
+          fi
+          sync
+          sudo btrfs filesystem sync "$TOP" || true
+          sudo fstrim -v "$TOP" || true
+
+          test -d "$LIVE"
+          if [ -e "$SNAP" ]; then
+            sudo btrfs subvolume delete "$SNAP"
+          fi
+          sudo btrfs subvolume snapshot -r "$LIVE" "$SNAP"
+          sudo btrfs subvolume show "$SNAP" | tee /tmp/rbe-test/job-b-rolling-subvolume.txt
+
+          # Stream directly to R2. No local 80+ GiB checkpoint file is created.
+          HASHER=$'import hashlib,sys\nh=hashlib.sha256(); n=0\ni=sys.stdin.buffer; o=sys.stdout.buffer\nwhile True:\n b=i.read(8*1024*1024)\n if not b: break\n h.update(b); n+=len(b); o.write(b); o.flush()\nopen(sys.argv[1],"w").write(h.hexdigest()+"\\n")\nopen(sys.argv[2],"w").write(str(n)+"\\n")'
+          set -o pipefail
+          sudo btrfs send --compressed-data "$SNAP" \
+            | python3 -c "$HASHER" "$HASH_FILE" "$BYTES_FILE" \
+            | rclone rcat "r2:${R2_BUCKET}/${ROLL_KEY}" \
+                --stats 30s --stats-one-line \
+                --s3-upload-cutoff 64M \
+                --s3-chunk-size 64M \
+                --s3-upload-concurrency 4
+
+          test -s "$HASH_FILE"
+          test -s "$BYTES_FILE"
+          ROLL_SHA="$(tr -d '\r\n' < "$HASH_FILE")"
+          ROLL_BYTES="$(tr -d '\r\n' < "$BYTES_FILE")"
+          test "$ROLL_BYTES" -gt 0
+
+          rclone copyto "$HASH_FILE" "r2:${R2_BUCKET}/${ROLL_SHA_KEY}"
+
+          python3 - "$META_FILE" <<'PYMETA'
+          import json, os, sys
+          p=sys.argv[1]
+          d={
+            "branch": os.environ["LINEAGE_BRANCH"],
+            "device": "starlte",
+            "target": "bacon",
+            "github_run_id": os.environ["GITHUB_RUN_ID"],
+            "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "parent_checkpoint_prefix": os.environ["CHECKPOINT_PREFIX"],
+            "checkpoint_prefix": f"lineage-checkpoints/bibicpu74/L23/{os.environ['LINEAGE_BRANCH']}/starlte/{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}",
+            "checkpoint_subvol": f"@checkpoint-roll-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+            "reason": "${{ steps.resume_build.outputs.checkpoint_reason }}",
+            "progress": "${{ steps.resume_build.outputs.checkpoint_progress }}",
+          }
+          json.dump(d, open(p,"w"), indent=2, sort_keys=True)
+          PYMETA
+          rclone copyto "$META_FILE" "r2:${R2_BUCKET}/${ROLL_META_KEY}"
+
+          # Verify that the multipart object exists remotely with exactly the
+          # byte count emitted by the Btrfs send stream.
+          rclone size "r2:${R2_BUCKET}/${ROLL_KEY}" --json \
+            > /tmp/rolling-checkpoint-remote-size.json
+          REMOTE_BYTES="$(python3 -c 'import json; print(json.load(open("/tmp/rolling-checkpoint-remote-size.json")).get("bytes",0))')"
+          if [ "$REMOTE_BYTES" != "$ROLL_BYTES" ]; then
+            echo "::error::Rolling checkpoint size mismatch: stream=$ROLL_BYTES remote=$REMOTE_BYTES"
+            exit 72
+          fi
+
+          {
+            echo "new_checkpoint_prefix=$ROLL_PREFIX"
+            echo "new_checkpoint_key=$ROLL_KEY"
+            echo "new_checkpoint_subvol=$SNAP_NAME"
+            echo "new_checkpoint_bytes=$ROLL_BYTES"
+            echo "new_checkpoint_sha256=$ROLL_SHA"
+          } | tee /tmp/rbe-test/job-b-rolling-checkpoint.txt
+
+          echo "checkpoint_prefix=$ROLL_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "checkpoint_key=$ROLL_KEY" >> "$GITHUB_OUTPUT"
+          echo "checkpoint_subvol=$SNAP_NAME" >> "$GITHUB_OUTPUT"
+          echo "checkpoint_bytes=$ROLL_BYTES" >> "$GITHUB_OUTPUT"
+          echo "checkpoint_sha256=$ROLL_SHA" >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## Rolling LineageOS checkpoint created'
+            echo
+            echo "- Progress: `${{ steps.resume_build.outputs.checkpoint_progress }}`"
+            echo "- Reason: `${{ steps.resume_build.outputs.checkpoint_reason }}`"
+            echo "- Prefix: \`$ROLL_PREFIX\`"
+            echo "- Key: \`$ROLL_KEY\`"
+            echo "- Subvolume: \`$SNAP_NAME\`"
+            echo "- Bytes: \`$ROLL_BYTES\`"
+            echo "- SHA256: \`$ROLL_SHA\`"
+            echo
+            echo 'Use these values for the next resume run. Keep the previous checkpoint until the new checkpoint has been restored and SHA-verified once.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload resumed LineageOS ROM
         if: ${{ steps.resume_build.outputs.completed == 'true' }}
         uses: actions/upload-artifact@v4
@@ -918,7 +1134,9 @@ jobs:
           mkdir -p /home/runner/work/los/resume-diagnostics
           SRC=/tmp/rbe-test
           DST=/home/runner/work/los/resume-diagnostics
-          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
+          [ -f /tmp/job-b-disk-after-restore.txt ] && cp /tmp/job-b-disk-after-restore.txt "$DST/" || true
+          [ -f /tmp/rolling-checkpoint-remote-size.json ] && cp /tmp/rolling-checkpoint-remote-size.json "$DST/" || true
+          for f in job-b-restore.txt job-b-repo-manifest-preflight.txt checkpoint-a-expected.sha256 resume-full-rom-build.log resume-build-attempts.txt job-b-disk-monitor.log job-b-swap-policy.txt job-b-rolling-checkpoint.txt job-b-rolling-subvolume.txt resumed-rom-sha256.txt tcp-keepalive-job-b.txt job-b-rbe-mode.txt job-b-reclient-upgrade.txt job-b-upgraded-reproxy-help.txt job-b-direct-rbe-supported-flags.txt job-b-direct-rbe-bootstrap.log job-b-direct-rbe-smoke.log job-b-direct-rbe-shutdown.log; do
             [ -f "$SRC/$f" ] || continue
             if [ "$(stat -c %s "$SRC/$f")" -gt 6291456 ]; then
               tail -c 6291456 "$SRC/$f" > "$DST/$f"
